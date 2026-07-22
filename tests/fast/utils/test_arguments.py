@@ -149,6 +149,16 @@ def test_recompute_logprobs_via_prefill_flag_is_parsed():
     assert args.recompute_logprobs_via_prefill is True
 
 
+@pytest.mark.parametrize(("extra_args", "expected"), [([], False), (["--enable-local-fb-warmup"], True)])
+def test_enable_local_fb_warmup_flag_is_parsed(extra_args, expected):
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    args = parser.parse_args(extra_args + REQUIRED_ARGS)
+
+    assert args.enable_local_fb_warmup is expected
+
+
 def test_custom_megatron_post_save_hook_path_is_parsed():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
