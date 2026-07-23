@@ -117,8 +117,7 @@ class DumperMegatronUtil:
         get_grad: Callable[[torch.nn.Parameter], torch.Tensor | None] | None = None
         if self.phase is DumperPhase.FWD_BWD and self.overrides.get("enable_model_grad"):
             _log_model_grad_coverage(extracted_model)
-            if enable_experimental_ft_trainer():
-                get_grad = _build_full_grad_getter(extracted_model)
+            get_grad = _build_full_grad_getter(extracted_model)
 
         # Weights/grads are a once-per-rollout end-state, so pin them to step 0 instead of
         # the running per-microbatch step. _configure already cleaned the scoped paths;
