@@ -16,7 +16,6 @@ from transformer_engine.pytorch.graph import restore_fp8_tensors, save_fp8_tenso
 
 from miles.backends.megatron_utils.parallel import get_packed_seq_params
 from miles.backends.training_utils.data import get_batch
-from miles.utils.distributed_utils import get_gloo_group
 
 logger = logging.getLogger(__name__)
 
@@ -102,90 +101,111 @@ def _get_local_input_shape(tokens, config):
 
 def run_local_fb_warmup(args, rollout_id, model, optimizer, data_iterator):
     """Run one local forward/backward on every pipeline stage."""
-    if len(model) != 1 or len(data_iterator) != 1:
-        raise RuntimeError("The local F/B warmup does not support virtual pipeline stages")
+    if len(model) != len(data_iterator):
+        raise RuntimeError(
+            f"The local F/B warmup needs one data iterator per model chunk; got {len(data_iterator)} "
+            f"iterators for {len(model)} chunks"
+        )
 
-    model_chunk = model[0]
-    if getattr(model_chunk, _WARMED_ATTR, False):
+    if all(getattr(model_chunk, _WARMED_ATTR, False) for model_chunk in model):
         return
 
-    config = get_model_config(model_chunk)
-    gloo_group = get_gloo_group()
+    pp_group = mpu.get_pipeline_model_parallel_group()
+    if pp_group.size() == 1:
+        if dist.get_rank() == 0:
+            logger.info("Skipping local F/B warmup because pipeline parallelism is disabled (PP size is 1)")
+        for model_chunk in model:
+            setattr(model_chunk, _WARMED_ATTR, True)
+        return
+
+    config = get_model_config(model[0])
+    vpp_enabled = len(model) > 1
     if dist.get_rank() == 0:
         logger.info("Starting PP-free local F/B warmup before rollout %s", rollout_id)
-    dist.barrier(group=gloo_group)
 
-    training = model_chunk.training
-    local_input = None
-    pre_hook_disabled = False
-    buffer_state = [(buffer, buffer.detach().clone()) for _, buffer in model_chunk.named_buffers()]
+    training = [model_chunk.training for model_chunk in model]
+    local_inputs = [None] * len(model)
+    buffer_state = [
+        (buffer, buffer.detach().clone())
+        for model_chunk in model
+        for _, buffer in model_chunk.named_buffers()
+    ]
     fp8_state = (
-        save_fp8_tensors([model_chunk], get_fp8_recipe(config))
+        save_fp8_tensors(model, get_fp8_recipe(config))
         if getattr(config, "fp8", None) is not None
         else None
     )
+    virtual_rank = mpu.get_virtual_pipeline_model_parallel_rank() if vpp_enabled else None
 
-    _zero_grad(model, optimizer)
     try:
         if args.use_distributed_optimizer and args.overlap_param_gather:
-            model_chunk.disable_forward_pre_hook(param_sync=False)
-            pre_hook_disabled = True
+            for model_chunk in model:
+                model_chunk.disable_forward_pre_hook(param_sync=False)
 
-        batch = get_batch(
-            data_iterator[0],
-            _BATCH_KEYS,
-            args.data_pad_size_multiplier,
-            args.qkv_format,
-            allgather_cp=args.allgather_cp,
-        )
-        tokens = batch["tokens"]
+        for vp_stage, (model_chunk, iterator) in enumerate(zip(model, data_iterator, strict=True)):
+            if vpp_enabled:
+                mpu.set_virtual_pipeline_model_parallel_rank(vp_stage)
 
-        if not get_attr_wrapped_model(model_chunk, "pre_process"):
-            local_input = torch.zeros(
-                _get_local_input_shape(tokens, config),
-                dtype=config.pipeline_dtype or config.params_dtype,
-                device=torch.cuda.current_device(),
-                requires_grad=True,
+            chunk_config = get_model_config(model_chunk)
+            batch = get_batch(
+                iterator,
+                _BATCH_KEYS,
+                args.data_pad_size_multiplier,
+                args.qkv_format,
+                allgather_cp=args.allgather_cp,
             )
+            tokens = batch["tokens"]
 
-        forward_kwargs = {
-            "input_ids": tokens,
-            "position_ids": None,
-            "attention_mask": None,
-            "labels": None,
-            "packed_seq_params": get_packed_seq_params(batch, args),
-            "loss_mask": batch["full_loss_masks"],
-        }
-        if args.enable_witness:
-            forward_kwargs["witness_ids"] = batch["witness_ids"]
-        if args.enable_mtp_training:
-            forward_kwargs["mtp_kwargs"] = {"mtp_labels": tokens}
-        if batch["multimodal_train_inputs"] is not None:
-            forward_kwargs.update(batch["multimodal_train_inputs"])
+            if not get_attr_wrapped_model(model_chunk, "pre_process"):
+                local_inputs[vp_stage] = torch.zeros(
+                    _get_local_input_shape(tokens, chunk_config),
+                    dtype=chunk_config.pipeline_dtype or chunk_config.params_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=True,
+                )
 
-        model_chunk.train()
-        if hasattr(model_chunk, "set_is_first_microbatch"):
-            model_chunk.set_is_first_microbatch()
-        if local_input is not None:
-            get_attr_wrapped_model(model_chunk, "set_input_tensor")([local_input])
+            forward_kwargs = {
+                "input_ids": tokens,
+                "position_ids": None,
+                "attention_mask": None,
+                "labels": None,
+                "packed_seq_params": get_packed_seq_params(batch, args),
+                "loss_mask": batch["full_loss_masks"],
+            }
+            if args.enable_witness:
+                forward_kwargs["witness_ids"] = batch["witness_ids"]
+            if args.enable_mtp_training:
+                forward_kwargs["mtp_kwargs"] = {"mtp_labels": tokens}
+            if batch["multimodal_train_inputs"] is not None:
+                forward_kwargs.update(batch["multimodal_train_inputs"])
 
-        pp_group = mpu.get_pipeline_model_parallel_group()
+            model_chunk.train()
+            if hasattr(model_chunk, "set_is_first_microbatch"):
+                model_chunk.set_is_first_microbatch()
+            if local_inputs[vp_stage] is not None:
+                get_attr_wrapped_model(model_chunk, "set_input_tensor")([local_inputs[vp_stage]])
+
+            autocast = (
+                torch.autocast("cuda", dtype=chunk_config.autocast_dtype)
+                if chunk_config.enable_autocast
+                else nullcontext()
+            )
+            with _fork_rng(), torch.enable_grad(), model_chunk.no_sync(), autocast:
+                # Warmup JIT kernels concurrently without PP serialization.
+                output = model_chunk(**forward_kwargs)
+                _zero_backward_seed(output).backward()
+
         p2p = P2PCommunicator(pp_group=pp_group, config=config)
-        is_pp_first_stage = mpu.is_pipeline_first_stage()
-        is_pp_last_stage = mpu.is_pipeline_last_stage()
+        is_pp_first_stage = mpu.is_pipeline_first_stage() and not vpp_enabled
+        is_pp_last_stage = mpu.is_pipeline_last_stage() and not vpp_enabled
         p2p_buffer_shape = _get_local_input_shape(tokens, config)
-        p2p_buffer = torch.empty(p2p_buffer_shape, dtype=config.pipeline_dtype, device=torch.cuda.current_device())
-
-        autocast = (
-            torch.autocast("cuda", dtype=config.autocast_dtype) if config.enable_autocast else nullcontext()
+        p2p_buffer = torch.empty(
+            p2p_buffer_shape, dtype=config.pipeline_dtype, device=torch.cuda.current_device()
         )
-        with _fork_rng(), torch.enable_grad(), model_chunk.no_sync(), autocast:
-            # Warmup JIT kernels concurrently without PP serialization
-            output = model_chunk(**forward_kwargs)
-            _zero_backward_seed(output).backward()
+
         # Setup transport channels (NCCL lazily creates them)
+        # Warmup respects VPP mapping if enabled.
         _, _ = p2p.send_forward_backward_recv_forward_backward(
-            # Avoid PP-group wraparound at the boundaries.
             output_tensor=None if is_pp_last_stage else p2p_buffer,
             input_tensor_grad=None if is_pp_first_stage else p2p_buffer,
             recv_prev=not is_pp_first_stage,
@@ -194,24 +214,27 @@ def run_local_fb_warmup(args, rollout_id, model, optimizer, data_iterator):
         )
         torch.cuda.synchronize()
     finally:
+        if vpp_enabled:
+            mpu.set_virtual_pipeline_model_parallel_rank(virtual_rank)
         if fp8_state is not None:
-            restore_fp8_tensors([model_chunk], fp8_state)
+            restore_fp8_tensors(model, fp8_state)
         for iterator in data_iterator:
             iterator.reset()
-        model_chunk.train(training)
-        if local_input is not None:
-            get_attr_wrapped_model(model_chunk, "set_input_tensor")([None])
-        _clear_deferred_embedding_buffers(config, model_chunk)
+        for vp_stage, model_chunk in enumerate(model):
+            model_chunk.train(training[vp_stage])
+            if local_inputs[vp_stage] is not None:
+                get_attr_wrapped_model(model_chunk, "set_input_tensor")([None])
+            _clear_deferred_embedding_buffers(get_model_config(model_chunk), model_chunk)
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                model_chunk.enable_forward_pre_hook()
         _clear_loss_trackers(args)
         reset_model_temporary_tensors(config, model)
         _zero_grad(model, optimizer)
         for buffer, saved_buffer in buffer_state:
             buffer.detach().copy_(saved_buffer)
-        if pre_hook_disabled:
-            model_chunk.enable_forward_pre_hook()
 
     torch.cuda.synchronize()
-    dist.barrier(group=gloo_group)
-    setattr(model_chunk, _WARMED_ATTR, True)
+    for model_chunk in model:
+        setattr(model_chunk, _WARMED_ATTR, True)
     if dist.get_rank() == 0:
         logger.info("PP-free local F/B warmup complete on every stage")

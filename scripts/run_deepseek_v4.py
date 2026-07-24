@@ -283,7 +283,10 @@ def _prepare_spmd(args: ScriptArgs):
         extra_args += (
             "--tensor-model-parallel-size 1 " "--pipeline-model-parallel-size 1 " "--expert-model-parallel-size 1 "
         )
-    elif actor_num_nodes == 8 and args.model_name == "DeepSeek-V4-Flash-FP8":
+    elif (
+        (actor_num_nodes == 8 and actor_num_gpus_per_node == 4)
+        or (actor_num_nodes == 4 and actor_num_gpus_per_node == 8)
+    ) and args.model_name == "DeepSeek-V4-Flash-FP8":
         extra_args += (
             "--tensor-model-parallel-size 1 "
             "--pipeline-model-parallel-size 8 "
@@ -371,18 +374,17 @@ def _get_parallel_config(args: ScriptArgs) -> str:
         )
 
     # GB300: 4 GPUs/node
-    if actor_num_gpus_per_node == 4:
-        if total_gpus == 32:  # 8 nodes x 4 GPUs
-            return (
-                "--tensor-model-parallel-size 2 "
-                "--sequence-parallel "
-                "--pipeline-model-parallel-size 8 "
-                "--decoder-first-pipeline-num-layers 4 "
-                "--decoder-last-pipeline-num-layers 3 "
-                "--context-parallel-size 2 "
-                "--expert-model-parallel-size 4 "
-                "--expert-tensor-parallel-size 1 "
-            )
+    if total_gpus == 32:  # 8 nodes x 4 GPUs
+        return (
+            "--tensor-model-parallel-size 2 "
+            "--sequence-parallel "
+            "--pipeline-model-parallel-size 8 "
+            "--decoder-first-pipeline-num-layers 4 "
+            "--decoder-last-pipeline-num-layers 3 "
+            "--context-parallel-size 2 "
+            "--expert-model-parallel-size 4 "
+            "--expert-tensor-parallel-size 1 "
+        )
 
     # H200: 8 GPUs/node
     if actor_num_gpus_per_node == 8:

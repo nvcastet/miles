@@ -211,7 +211,7 @@ Sections mirror the launch-script argument groups.
 | `--context-parallel-size` | int | `1` | CP. |
 | `--expert-model-parallel-size` | int | `1` | EP (MoE). |
 | `--expert-tensor-parallel-size` | int | `1` | TP within experts. |
-| `--enable-local-fb-warmup` | flag | off | Megatron only: before the first actor step, run one PP-free local forward/backward per stage without an optimizer step or gradient synchronization. Virtual pipeline stages are unsupported. |
+| `--enable-local-fb-warmup` | flag | off | Megatron only: before the first actor step, run one PP-free local forward/backward per stage and virtual chunk without an optimizer step or gradient synchronization. Skipped when PP size is 1. |
 | `--sequence-parallel` | flag | off | Enable Megatron sequence parallel. |
 | `--use-dynamic-batch-size` | flag | off | Pack varlen samples. Recommended for varlen workloads. |
 | `--max-tokens-per-gpu` | int | – | Token budget per micro-batch per GPU. Required when dynamic batching is on. |

@@ -185,7 +185,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Megatron only: run one PP-free local forward/backward on every pipeline stage before the "
                     "first actor step, without an optimizer step or gradient synchronization. "
-                    "Virtual pipeline stages are not supported."
+                    "Virtual pipeline stages are warmed one chunk at a time; skipped when PP size is 1."
                 ),
             )
             parser.add_argument(
