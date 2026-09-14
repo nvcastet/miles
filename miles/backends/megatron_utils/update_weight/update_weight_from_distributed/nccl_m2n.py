@@ -134,14 +134,15 @@ def _fp8_manifest_quantization(
         quantization_config.get("quant_method") != "fp8"
         or quantization_config.get("fmt", "e4m3") != "e4m3"
         or quantization_config.get("activation_scheme") != "dynamic"
-        or quantization_config.get("scale_fmt") not in (None, "fp32")
         or list(quantization_config.get("weight_block_size") or ()) != list(_FP8_BLOCK_SIZE)
     ):
         raise ValueError(
             "NCCL M2N supports only block FP8 rollout weights with "
             "quant_method='fp8', fmt='e4m3', activation_scheme='dynamic', "
-            "weight_block_size=[128, 128], and canonical FP32 scales"
+            "weight_block_size=[128, 128]"
         )
+    # Checkpoint scale_fmt does not determine the M2N wire format: source
+    # weights are requantized and scales are transferred as canonical FP32.
     return dict(_FP8_MANIFEST_QUANTIZATION)
 
 
@@ -320,7 +321,7 @@ def _local_source_spec(
     partition_dim = int(getattr(tensor, "partition_dim", -1))
     partition_stride = int(getattr(tensor, "partition_stride", 1))
     if family == "dense" and projection == "1":
-        # Qwen3 SwiGLU stores each local TP shard as [gate, up]. Older
+        # Fused SwiGLU FC1 stores each local TP shard as [gate, up]. Older
         # Megatron/TE versions do not consistently expose partition_stride=2.
         partition_dim = 0
         partition_stride = 2
