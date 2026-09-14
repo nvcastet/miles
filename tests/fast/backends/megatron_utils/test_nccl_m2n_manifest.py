@@ -493,7 +493,7 @@ def test_routed_experts_reject_hybrid_rollout_ep_and_moe_tp():
         )
 
 
-@pytest.mark.parametrize("scale_fmt", [None, "fp32"])
+@pytest.mark.parametrize("scale_fmt", [None, "fp32", "ue8m0"])
 def test_fp8_manifest_v1_models_complete_expert_weight_scale_pairs(scale_fmt):
     quantization_config = deepcopy(_FP8_CONFIG)
     if scale_fmt is not None:
@@ -687,10 +687,6 @@ def test_fp8_partial_fc1_atomic_unit_drops_the_whole_expert_module():
         (
             {**_FP8_CONFIG, "weight_block_size": [64, 128]},
             r"(?i)(block|128)",
-        ),
-        (
-            {**_FP8_CONFIG, "scale_fmt": "ue8m0"},
-            r"(?i)(scale|canonical|fp32)",
         ),
         (
             {key: value for key, value in _FP8_CONFIG.items() if key != "weight_block_size"},
