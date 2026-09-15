@@ -12,8 +12,8 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
     UpdateWeightFromNcclM2N,
     _build_manifest,
     _new_m2n_group_name,
+    _split_manifest_by_pp,
 )
-
 
 _LAYER_COUNTS = (4, 6, 6, 6, 6, 6, 6, 3)
 _EXPERTS_PER_RANK = 2
@@ -888,6 +888,197 @@ def test_m2n_group_names_are_unique_per_connection():
     assert first != second
 
 
+@pytest.mark.parametrize("fp8", [False, True])
+def test_pp8_communicators_remap_owners_and_all_eight_rollout_replicas(fp8):
+    payloads = _payloads()
+    if fp8:
+        for payload in payloads:
+            for spec in payload["specs"]:
+                if spec["family"] == "routed_expert":
+                    spec["local_shape"] = [512, 256] if spec["projection"] == "fc1" else [256, 256]
+    manifest = _build_manifest(payloads, [4] * 8, quantization_config=_FP8_CONFIG if fp8 else None)
+    original = deepcopy(manifest)
+    stages = _split_manifest_by_pp(manifest)
+    assert list(stages) == list(range(8))
+    assert manifest == original
+    assert sum(len(stage["entries"]) for stage in stages.values()) == len(manifest["entries"])
+    for pp_rank, stage in stages.items():
+        assert stage["communicator_world_size"] == 36
+        assert stage["source_world_ranks"] == list(range(4 * pp_rank, 4 * pp_rank + 4))
+        assert stage["trainer_world_to_comm_rank"] == {str(4 * pp_rank + rank): rank for rank in range(4)}
+        assert stage["pp_rank"] == pp_rank
+        assert stage["manifest_hash"] == nccl_m2n._manifest_digest(stage)
+        if fp8:
+            assert stage["quantization"] == manifest["quantization"]
+            nccl_m2n._validate_fp8_pairs(stage["entries"])
+        for entry in stage["entries"]:
+            before = _entry(manifest, entry["name"])
+            assert entry["pp_rank"] == pp_rank
+            assert entry["global_shape"] == before["global_shape"]
+            assert entry["destination"]["parameter"] == before["destination"]["parameter"]
+            assert entry["destination"]["mesh"] == [
+                list(range(4 + 4 * replica, 8 + 4 * replica)) for replica in range(8)
+            ]
+            assert entry["source"]["mesh"] == [[rank - 4 * pp_rank for rank in before["source"]["mesh"][0]]]
+            assert entry["source"]["names_by_rank"] == {
+                str(int(rank) - 4 * pp_rank): names for rank, names in before["source"]["names_by_rank"].items()
+            }
+
+
+def test_pp1_and_empty_bulk_stages_do_not_create_extra_communicators():
+    manifest = _build_manifest([_reduced_pp1_payload(rank) for rank in range(2)], [2])
+    stages = _split_manifest_by_pp(manifest)
+    assert list(stages) == [0]
+    assert stages[0]["communicator_world_size"] == 4
+    assert stages[0]["entries"] == manifest["entries"]
+
+    manifest = _build_manifest(_payloads(), [4] * 8)
+    manifest["entries"] = [entry for entry in manifest["entries"] if entry["pp_rank"] in (2, 7)]
+    stages = _split_manifest_by_pp(manifest)
+    assert list(stages) == [2, 7]
+    assert stages[2]["source_world_ranks"] == [8, 9, 10, 11]
+    assert stages[7]["source_world_ranks"] == [28, 29, 30, 31]
+    assert all(stage["communicator_world_size"] == 36 for stage in stages.values())
+
+
+@pytest.mark.parametrize("world_rank", [0, 1, 2, 3])
+@pytest.mark.parametrize("fail_second_stage", [False, True])
+def test_connect_joins_only_local_pp_and_initializes_each_stage_on_every_engine(world_rank, fail_second_stage):
+    manifest = _build_manifest([_reduced_pp2_payload(rank) for rank in range(4)], [2, 2])
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater.args = SimpleNamespace(rollout_num_gpus=4, rollout_num_gpus_per_engine=2, pipeline_model_parallel_size=2)
+    updater._m2n_manifest = manifest
+    updater._m2n_group_names = {}
+    updater._m2n_group_name = None
+    updater._m2n_pg = None
+    updater._connection_stale = True
+    updater._disconnect_existing = Mock()
+    updater._negotiate_manifest = Mock(return_value=manifest)
+    engines = [Mock(), Mock()]
+
+    def rendezvous(objects, src, group):
+        objects[0] = {"master_address": "127.0.0.1", "master_port": 1234 + src, "group_name": f"pp-{src // 2}"}
+
+    def collect(error):
+        # Inject the globally propagated error on the second setup collective.
+        if fail_second_stage and len(updater._m2n_group_names) == 2:
+            return ["injected PP1 receiver initialization failure"]
+        return [error] if error else []
+
+    with (
+        patch.object(
+            nccl_m2n, "get_parallel_state", return_value=SimpleNamespace(pp=SimpleNamespace(rank=world_rank // 2))
+        ),
+        patch.object(nccl_m2n.dist, "get_rank", return_value=world_rank),
+        patch.object(nccl_m2n.dist, "broadcast_object_list", side_effect=rendezvous),
+        patch.object(nccl_m2n, "get_gloo_group"),
+        patch.object(nccl_m2n, "_collect_errors", side_effect=collect),
+        patch.object(nccl_m2n, "_process_group_options"),
+        patch.object(nccl_m2n, "init_process_group") as init_pg,
+        patch.object(nccl_m2n, "_warm_and_borrow_nccl_comm", return_value=123 + world_rank),
+        patch.object(nccl_m2n.socket, "socket"),
+        patch.object(nccl_m2n.ray._private.services, "get_node_ip_address", return_value="127.0.0.1"),
+        patch.object(nccl_m2n.torch.cuda, "current_device", return_value=0),
+        patch.object(nccl_m2n.ray, "get", return_value=[{"success": True}, {"success": True}]),
+        patch.object(UpdateWeightFromNcclM2N, "_is_source", False),
+    ):
+        if fail_second_stage:
+            with pytest.raises(RuntimeError, match="PP1 receiver initialization failure"):
+                updater.connect_rollout_engines(engines, Mock())
+            assert updater._disconnect_existing.call_count == 2
+            assert updater._connection_stale is True
+        else:
+            updater.connect_rollout_engines(engines, Mock())
+            assert updater._connection_stale is False
+    assert updater._m2n_group_names == {0: "pp-0", 1: "pp-1"}
+    assert init_pg.call_count == 1
+    assert init_pg.call_args.kwargs["world_size"] == 6
+    assert init_pg.call_args.kwargs["rank"] == world_rank % 2
+    assert init_pg.call_args.kwargs["group_name"] == f"pp-{world_rank // 2}"
+    assert updater._m2n_comm_rank == world_rank % 2
+    for replica, engine in enumerate(engines):
+        calls = engine.init_weights_update_group.remote.call_args_list
+        assert len(calls) == (2 if world_rank == 0 else 0)
+        for pp_rank, invocation in enumerate(calls):
+            assert invocation.args[2:5] == (2 + 2 * replica, 6, f"pp-{pp_rank}")
+            assert invocation.kwargs["m2n_manifest"]["pp_rank"] == pp_rank
+
+
+@pytest.mark.parametrize("local_pp", [0, 1])
+def test_stage_update_uses_only_owning_trainers_and_routes_receiver_rpc(local_pp):
+    stages = _split_manifest_by_pp(_build_manifest([_reduced_pp2_payload(rank) for rank in range(4)], [2]))
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater._m2n_group_names = {0: "pp-0", 1: "pp-1"}
+    updater._m2n_group_name = f"pp-{local_pp}"
+    updater._run_m2n_batch = Mock()
+    engine = Mock()
+    updater.rollout_engines = [engine]
+    with (
+        patch.object(nccl_m2n.dist, "get_rank", return_value=2 * local_pp),
+        patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
+        patch.object(nccl_m2n.ray, "get", return_value=[{"success": True}]),
+    ):
+        for stage, manifest in stages.items():
+            updater._update_m2n_stage(stage, manifest)
+    updater._run_m2n_batch.assert_called_once_with(stages[local_pp])
+    calls = engine.update_weights_from_distributed.remote.call_args_list
+    assert len(calls) == (2 if local_pp == 0 else 0)
+    for pp_rank, invocation in enumerate(calls):
+        assert invocation.kwargs["group_name"] == f"pp-{pp_rank}"
+        assert invocation.kwargs["names"] == [entry["name"] for entry in stages[pp_rank]["entries"]]
+
+
+def test_failed_stage_update_releases_lock_without_starting_later_stages():
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater._m2n_manifest = {"entries": []}
+    updater._m2n_group_names = {0: "pp-0", 1: "pp-1", 2: "pp-2"}
+    updater._m2n_stage_manifests = {0: {}, 1: {}, 2: {}}
+    updater._connection_stale = False
+    updater.rollout_engine_lock = Mock()
+    updater._update_m2n_stage = Mock(side_effect=[None, RuntimeError("injected PP1 failure")])
+    with (
+        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
+        patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
+        patch.object(nccl_m2n.ray, "get", return_value=True),
+        pytest.raises(RuntimeError, match="PP1 failure"),
+    ):
+        updater._update_bulk_weights()
+    assert updater._update_m2n_stage.call_args_list == [call(0, {}), call(1, {})]
+    updater.rollout_engine_lock.release.remote.assert_called_once()
+    assert updater._connection_stale is True
+
+
+def test_sender_orders_dense_expert_source_handoffs_inside_one_pp_group():
+    manifest = _split_manifest_by_pp(_build_manifest(_payloads(), [4] * 8))[0]
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater._m2n_manifest = manifest
+    updater._m2n_pg = object()
+    updater._m2n_comm_ptr = 123
+    updater._m2n_comm_rank = 0
+    updater._m2n_fp8_pair_cache = {}
+    updater._source_tensor = Mock(return_value=object())
+    m2n = Mock()
+    events = []
+    m2n.reshard.side_effect = lambda *args, **kwargs: events.append(kwargs["src_mesh"])
+    with (
+        patch.object(nccl_m2n, "_nccl_rl", return_value=m2n),
+        patch.object(nccl_m2n.torch.cuda, "current_stream"),
+        patch.object(nccl_m2n.dist, "barrier", side_effect=lambda group: events.append("handoff")) as barrier,
+    ):
+        updater._run_m2n_batch(manifest)
+    expected = []
+    previous = None
+    for entry in manifest["entries"]:
+        mesh = entry["source"]["mesh"]
+        if previous is not None and previous != mesh:
+            expected.append("handoff")
+        expected.append(mesh)
+        previous = mesh
+    assert events == expected
+    assert barrier.call_count > 0
+    assert all(invocation.kwargs["group"] is updater._m2n_pg for invocation in barrier.call_args_list)
+
+
 def test_prepare_failure_is_propagated_before_the_phase_barrier():
     updater = object.__new__(UpdateWeightFromNcclM2N)
     updater._connection_stale = False
@@ -1022,6 +1213,7 @@ def test_teardown_launches_remote_before_destroying_local_and_waiting():
     updater.rollout_engines = [engine]
     updater._m2n_manifest = {"entries": []}
     updater._m2n_group_name = "miles-m2n-old"
+    updater._m2n_group_names = {0: "miles-m2n-old", 1: "miles-m2n-old-pp1"}
     updater._m2n_routed_units = set()
     updater._group_name = "miles-pp-0"
     updater._model_update_groups = process_group
@@ -1051,8 +1243,10 @@ def test_teardown_launches_remote_before_destroying_local_and_waiting():
 
     assert events == [
         "launch:miles-m2n-old",
+        "launch:miles-m2n-old-pp1",
         "local:miles-m2n-old",
         "wait:miles-m2n-old",
+        "wait:miles-m2n-old-pp1",
         "launch:miles-pp-0",
         "local:miles-pp-0",
         "wait:miles-pp-0",
@@ -1070,6 +1264,7 @@ def test_mixed_teardown_success_is_idempotently_retryable():
     updater.rollout_engines = engines
     updater._m2n_manifest = {"entries": []}
     updater._m2n_group_name = "miles-m2n-old"
+    updater._m2n_group_names = {0: "miles-m2n-old"}
     updater._m2n_routed_units = {("weight",)}
     updater._model_update_groups = None
     updater._connection_stale = False
@@ -1128,6 +1323,7 @@ def test_local_teardown_failure_is_propagated_collectively_and_retryable():
     updater.rollout_engines = []
     updater._m2n_manifest = {"entries": []}
     updater._m2n_group_name = "miles-m2n-old"
+    updater._m2n_group_names = {0: "miles-m2n-old"}
     updater._m2n_routed_units = set()
     updater._model_update_groups = None
     updater._connection_stale = False
@@ -1164,6 +1360,7 @@ def test_unreachable_retired_engine_does_not_block_replacement():
     updater.rollout_engines = [retired_engine]
     updater._m2n_manifest = {"entries": []}
     updater._m2n_group_name = "miles-m2n-retired"
+    updater._m2n_group_names = {0: "miles-m2n-retired"}
     updater._m2n_routed_units = set()
     updater._group_name = "miles-pp-0"
     updater._model_update_groups = object()
@@ -1208,6 +1405,7 @@ def test_failed_residual_teardown_retains_connection_state_for_retry():
     updater.rollout_engines = [engine]
     updater._m2n_manifest = {"entries": []}
     updater._m2n_group_name = "miles-m2n-old"
+    updater._m2n_group_names = {0: "miles-m2n-old"}
     updater._m2n_routed_units = set()
     updater._group_name = "miles-pp-0"
     updater._model_update_groups = process_group
