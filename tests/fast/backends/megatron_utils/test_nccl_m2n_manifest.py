@@ -1030,6 +1030,7 @@ def test_stage_update_uses_only_owning_trainers_and_routes_receiver_rpc(local_pp
 
 def test_failed_stage_update_releases_lock_without_starting_later_stages():
     updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater.args = SimpleNamespace(m2n_pp_concurrency=1)
     updater._m2n_manifest = {"entries": []}
     updater._m2n_group_names = {0: "pp-0", 1: "pp-1", 2: "pp-2"}
     updater._m2n_stage_manifests = {0: {}, 1: {}, 2: {}}
@@ -1044,6 +1045,79 @@ def test_failed_stage_update_releases_lock_without_starting_later_stages():
     ):
         updater._update_bulk_weights()
     assert updater._update_m2n_stage.call_args_list == [call(0, {}), call(1, {})]
+    updater.rollout_engine_lock.release.remote.assert_called_once()
+    assert updater._connection_stale is True
+
+
+@pytest.mark.parametrize("local_pp", [0, 1, 2])
+def test_concurrent_wave_dispatches_one_rpc_and_only_local_selected_stage(local_pp):
+    stages = _split_manifest_by_pp(_build_manifest(_payloads(), [4] * 8))
+    wave = {stage: stages[stage] for stage in (0, 1)}
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater._m2n_group_names = {stage: f"pp-{stage}" for stage in stages}
+    updater._m2n_group_name = f"pp-{local_pp}"
+    updater._run_m2n_batch = Mock()
+    updater.rollout_engines = [Mock(), Mock()]
+    with (
+        patch.object(nccl_m2n.dist, "get_rank", return_value=4 * local_pp),
+        patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
+        patch.object(nccl_m2n.ray, "get", return_value=[{"success": True}] * 2),
+    ):
+        updater._update_m2n_stages(wave)
+    if local_pp in wave:
+        updater._run_m2n_batch.assert_called_once_with(wave[local_pp])
+    else:
+        updater._run_m2n_batch.assert_not_called()
+    for engine in updater.rollout_engines:
+        if local_pp != 0:
+            engine.update_weights_from_distributed.remote.assert_not_called()
+            continue
+        engine.update_weights_from_distributed.remote.assert_called_once()
+        payload = engine.update_weights_from_distributed.remote.call_args.kwargs
+        assert payload["group_name"] == "pp-0"
+        assert payload["m2n_group_names"] == ["pp-0", "pp-1"]
+        assert payload["names"] == [entry["name"] for stage in wave.values() for entry in stage["entries"]]
+
+
+@pytest.mark.parametrize("concurrency", [None, 1, 2, 3, 8])
+def test_pp_wave_scheduling_is_bounded_and_covers_uneven_tail(concurrency):
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater.args = SimpleNamespace(**({} if concurrency is None else {"m2n_pp_concurrency": concurrency}))
+    updater._m2n_manifest = {"entries": []}
+    updater._m2n_group_names = {stage: f"pp-{stage}" for stage in range(5)}
+    updater._m2n_stage_manifests = {stage: {} for stage in range(5)}
+    updater.rollout_engine_lock = Mock()
+    waves = []
+    updater._update_m2n_stage = lambda stage, manifest: waves.append([stage])
+    updater._update_m2n_stages = lambda stages: waves.append(list(stages))
+    with (
+        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
+        patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
+        patch.object(nccl_m2n.ray, "get", return_value=True),
+    ):
+        assert updater._update_bulk_weights() is True
+    width = 2 if concurrency is None else concurrency
+    assert waves == [list(range(start, min(start + width, 5))) for start in range(0, 5, width)]
+    updater.rollout_engine_lock.acquire.remote.assert_called_once()
+    updater.rollout_engine_lock.release.remote.assert_called_once()
+
+
+def test_failed_concurrent_wave_stops_later_waves_and_releases_lock():
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater.args = SimpleNamespace(m2n_pp_concurrency=2)
+    updater._m2n_manifest = {"entries": []}
+    updater._m2n_group_names = {stage: f"pp-{stage}" for stage in range(4)}
+    updater._m2n_stage_manifests = {stage: {} for stage in range(4)}
+    updater.rollout_engine_lock = Mock()
+    updater._update_m2n_stages = Mock(side_effect=RuntimeError("injected wave failure"))
+    with (
+        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
+        patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
+        patch.object(nccl_m2n.ray, "get", return_value=True),
+        pytest.raises(RuntimeError, match="wave failure"),
+    ):
+        updater._update_bulk_weights()
+    updater._update_m2n_stages.assert_called_once_with({0: {}, 1: {}})
     updater.rollout_engine_lock.release.remote.assert_called_once()
     assert updater._connection_stale is True
 
