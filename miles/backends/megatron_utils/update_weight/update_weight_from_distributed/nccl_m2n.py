@@ -11,6 +11,7 @@ import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from typing import Any
 
 import ray
@@ -182,6 +183,44 @@ def _quantize_canonical_block_fp8(
 def _manifest_digest(manifest: Mapping[str, Any]) -> str:
     payload = {key: value for key, value in manifest.items() if key != "manifest_hash"}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _split_manifest_by_pp(manifest: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
+    """Give each PP owner a communicator-local manifest and staging namespace."""
+    source_world = manifest["source_world_ranks"]
+    destination_count = manifest["communicator_world_size"] - len(source_world)
+    stages: dict[int, dict[str, Any]] = {}
+    owners: dict[int, int] = {}
+    for pp_rank in sorted({entry["pp_rank"] for entry in manifest["entries"]}):
+        entries = deepcopy([entry for entry in manifest["entries"] if entry["pp_rank"] == pp_rank])
+        source_ranks = sorted({rank for entry in entries for row in entry["source"]["mesh"] for rank in row})
+        for rank in source_ranks:
+            previous = owners.setdefault(rank, pp_rank)
+            if previous != pp_rank:
+                raise ValueError(f"Trainer communicator rank {rank} belongs to multiple PP stages")
+        rank_map = {rank: local_rank for local_rank, rank in enumerate(source_ranks)}
+        rank_map.update({len(source_world) + rank: len(source_ranks) + rank for rank in range(destination_count)})
+        for entry in entries:
+            for side in ("source", "destination"):
+                entry[side]["mesh"] = [[rank_map[rank] for rank in row] for row in entry[side]["mesh"]]
+            entry["source"]["names_by_rank"] = {
+                str(rank_map[int(rank)]): names for rank, names in entry["source"]["names_by_rank"].items()
+            }
+        stage_world = [source_world[rank] for rank in source_ranks]
+        stage = {
+            "schema_version": manifest["schema_version"],
+            "pp_rank": pp_rank,
+            "source_world_ranks": stage_world,
+            "trainer_world_to_comm_rank": {str(rank): local_rank for local_rank, rank in enumerate(stage_world)},
+            "communicator_world_size": len(stage_world) + destination_count,
+            "entries": entries,
+        }
+        if "quantization" in manifest:
+            stage["quantization"] = deepcopy(manifest["quantization"])
+            _validate_fp8_pairs(entries)
+        stage["manifest_hash"] = _manifest_digest(stage)
+        stages[pp_rank] = stage
+    return stages
 
 
 def _one_owner(candidates: list[dict[str, Any]], description: str) -> int:
@@ -890,7 +929,11 @@ def _collect_errors(error: str | None) -> list[str]:
 
 
 class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
-    """Send supported FFN weights with nccl-rl and broadcast the rest."""
+    """Reshard FFNs on one M2N communicator per PP stage; broadcast the rest.
+
+    The global manifest negotiates coverage only. Wire manifests rebase each
+    stage's source ranks and give rollout a separate native staging namespace.
+    """
 
     def __init__(
         self,
@@ -919,6 +962,8 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         self._m2n_pg: dist.ProcessGroup | None = None
         self._m2n_comm_ptr: int | None = None
         self._m2n_manifest: dict[str, Any] | None = None
+        self._m2n_stage_manifests: dict[int, dict[str, Any]] = {}
+        self._m2n_group_names: dict[int, str] = {}
         self._m2n_comm_rank: int | None = None
         self._m2n_local_tensors: dict[str, torch.Tensor] = {}
         self._m2n_fp8_pair_cache: dict[str, dict[str, torch.Tensor]] = {}
@@ -1113,11 +1158,13 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
                 self._connection_stale = True
                 raise RuntimeError(f"{message}: {' | '.join(failures)}")
 
-        m2n_refs, m2n_errors = (
-            launch_remote_destroy(self._m2n_group_name)
-            if self._m2n_manifest is not None and self._m2n_group_name is not None
-            else ([], [])
-        )
+        # Dispatch every stage before local teardown: rollout must release all
+        # native M2N caches while all of its PP communicators are still alive.
+        m2n_refs, m2n_errors = [], []
+        for group_name in self._m2n_group_names.values():
+            refs, errors = launch_remote_destroy(group_name)
+            m2n_refs.extend(refs)
+            m2n_errors.extend(errors)
         local_m2n_error: str | None = None
         try:
             self._teardown_local_m2n()
@@ -1128,7 +1175,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             m2n_error = local_m2n_error if m2n_error is None else f"{local_m2n_error} | {m2n_error}"
         raise_collective(
             m2n_error,
-            f"Failed to destroy nccl-rl connection {self._m2n_group_name!r}",
+            "Failed to destroy nccl-rl PP connections",
         )
 
         pp_size = getattr(
@@ -1174,6 +1221,8 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         self._m2n_manifest = None
         self._m2n_routed_units.clear()
         self._m2n_group_name = None
+        self._m2n_group_names.clear()
+        self._m2n_stage_manifests = {}
 
     def connect_rollout_engines(
         self,
@@ -1197,87 +1246,89 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         self._group_name = f"miles-pp_{self._residual_pp_rank}"
         manifest = self._negotiate_manifest(engine_gpu_counts)
 
-        connection: list[dict[str, Any] | None] = [None]
-        rendezvous_world_rank = manifest["source_world_ranks"][0]
-        if dist.get_rank() == rendezvous_world_rank:
-            master_address = ray._private.services.get_node_ip_address()
-            with socket.socket() as sock:
-                sock.bind(("", 0))
-                master_port = sock.getsockname()[1]
-            connection[0] = {
-                "master_address": master_address,
-                "master_port": master_port,
-                "group_name": _new_m2n_group_name(),
-            }
-        dist.broadcast_object_list(
-            connection,
-            src=rendezvous_world_rank,
-            group=get_gloo_group(),
-        )
-        if connection[0] is None:
-            raise RuntimeError(f"Trainer rank {rendezvous_world_rank} did not publish NCCL M2N " "rendezvous metadata")
-        self._m2n_group_name = connection[0]["group_name"]
-
-        refs = []
-        if dist.get_rank() == 0:
-            rank_cursor = len(manifest["source_world_ranks"])
-            for engine, count in zip(rollout_engines, engine_gpu_counts, strict=True):
-                refs.append(
-                    engine.init_weights_update_group.remote(
-                        connection[0]["master_address"],
-                        connection[0]["master_port"],
-                        rank_cursor,
-                        manifest["communicator_world_size"],
-                        self._m2n_group_name,
-                        backend="nccl",
-                        m2n_manifest=manifest,
-                    )
-                )
-                rank_cursor += count
-
-        local_error: str | None = None
-        world_to_comm = manifest["trainer_world_to_comm_rank"]
-        comm_rank = world_to_comm.get(str(dist.get_rank()))
-        if comm_rank is not None:
-            try:
-                self._m2n_comm_rank = comm_rank
-                device = torch.device("cuda", torch.cuda.current_device())
-                self._m2n_pg = init_process_group(
-                    backend="nccl",
-                    init_method=(f"tcp://{connection[0]['master_address']}:{connection[0]['master_port']}"),
-                    world_size=manifest["communicator_world_size"],
-                    rank=comm_rank,
-                    group_name=self._m2n_group_name,
-                    pg_options=_process_group_options(),
-                )
-                self._m2n_comm_ptr = _warm_and_borrow_nccl_comm(self._m2n_pg, device)
-            except Exception as exc:
-                local_error = f"trainer rank {dist.get_rank()}: {type(exc).__name__}: {exc}"
-        if dist.get_rank() == 0:
-            try:
-                results = ray.get(refs)
-                _check_engine_results(results, "M2N initialization")
-            except Exception as exc:
-                local_error = f"SGLang initialization: {type(exc).__name__}: {exc}"
-
-        failures = _collect_errors(local_error)
-        if failures:
-            cleanup_refs = []
-            if dist.get_rank() == 0:
-                cleanup_refs = [
-                    engine.destroy_weights_update_group.remote(self._m2n_group_name) for engine in rollout_engines
-                ]
-            self._teardown_local_m2n()
+        self._m2n_stage_manifests = _split_manifest_by_pp(manifest)
+        for pp_rank, stage_manifest in self._m2n_stage_manifests.items():
+            connection: list[dict[str, Any] | None] = [None]
+            rendezvous_world_rank = stage_manifest["source_world_ranks"][0]
+            if dist.get_rank() == rendezvous_world_rank:
+                master_address = ray._private.services.get_node_ip_address()
+                with socket.socket() as sock:
+                    sock.bind(("", 0))
+                    master_port = sock.getsockname()[1]
+                connection[0] = {
+                    "master_address": master_address,
+                    "master_port": master_port,
+                    "group_name": f"{_new_m2n_group_name()}-pp{pp_rank}",
+                }
+            dist.broadcast_object_list(connection, src=rendezvous_world_rank, group=get_gloo_group())
+            if connection[0] is None:
+                raise RuntimeError(f"Trainer rank {rendezvous_world_rank} did not publish PP={pp_rank} M2N metadata")
+            group_name = connection[0]["group_name"]
+            # Record before setup so partially initialized remote groups can be
+            # cleaned up if a later stage or receiver fails initialization.
+            self._m2n_group_names[pp_rank] = group_name
+            refs = []
+            local_error: str | None = None
             if dist.get_rank() == 0:
                 try:
-                    _check_engine_results(ray.get(cleanup_refs), "failed M2N setup cleanup")
+                    rank_cursor = len(stage_manifest["source_world_ranks"])
+                    for engine, count in zip(rollout_engines, engine_gpu_counts, strict=True):
+                        refs.append(
+                            engine.init_weights_update_group.remote(
+                                connection[0]["master_address"],
+                                connection[0]["master_port"],
+                                rank_cursor,
+                                stage_manifest["communicator_world_size"],
+                                group_name,
+                                backend="nccl",
+                                m2n_manifest=stage_manifest,
+                            )
+                        )
+                        rank_cursor += count
                 except Exception as exc:
-                    logger.warning(
-                        "Failed to clean up SGLang M2N groups after setup failure: %s",
-                        exc,
+                    local_error = f"PP={pp_rank} rollout initialization dispatch: {type(exc).__name__}: {exc}"
+
+            comm_rank = stage_manifest["trainer_world_to_comm_rank"].get(str(dist.get_rank()))
+            if comm_rank is not None:
+                try:
+                    self._m2n_group_name = group_name
+                    self._m2n_comm_rank = comm_rank
+                    device = torch.device("cuda", torch.cuda.current_device())
+                    self._m2n_pg = init_process_group(
+                        backend="nccl",
+                        init_method=f"tcp://{connection[0]['master_address']}:{connection[0]['master_port']}",
+                        world_size=stage_manifest["communicator_world_size"],
+                        rank=comm_rank,
+                        group_name=group_name,
+                        pg_options=_process_group_options(),
                     )
-            self._connection_stale = True
-            raise RuntimeError("NCCL M2N connection setup failed: " + " | ".join(failures))
+                    self._m2n_comm_ptr = _warm_and_borrow_nccl_comm(self._m2n_pg, device)
+                except Exception as exc:
+                    local_error = f"trainer rank {dist.get_rank()}: {type(exc).__name__}: {exc}"
+            if dist.get_rank() == 0:
+                try:
+                    _check_engine_results(ray.get(refs), f"PP={pp_rank} M2N initialization")
+                except Exception as exc:
+                    remote_error = f"SGLang PP={pp_rank} initialization: {type(exc).__name__}: {exc}"
+                    local_error = f"{local_error}; {remote_error}" if local_error else remote_error
+
+            failures = _collect_errors(local_error)
+            if failures:
+                self._connection_stale = True
+                try:
+                    self._disconnect_existing()
+                except Exception as exc:
+                    logger.warning("Failed to clean up partial M2N PP connections: %s", exc)
+                raise RuntimeError(f"NCCL M2N PP={pp_rank} connection setup failed: " + " | ".join(failures))
+            if dist.get_rank() == 0:
+                logger.info(
+                    "NCCL M2N PP=%d group=%s world_size=%d source_world_ranks=%s entries=%d",
+                    pp_rank,
+                    group_name,
+                    stage_manifest["communicator_world_size"],
+                    stage_manifest["source_world_ranks"],
+                    len(stage_manifest["entries"]),
+                )
 
         local_pp_rank = self._residual_pp_rank
         for pp_rank in range(self.args.pipeline_model_parallel_size):
@@ -1416,7 +1467,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             return torch.stack(tensors)
         raise RuntimeError(f"Unknown NCCL M2N source recipe {recipe!r}")
 
-    def _run_m2n_batch(self) -> None:
+    def _run_m2n_batch(self, manifest: Mapping[str, Any] | None = None) -> None:
         if (
             self._m2n_manifest is None
             or self._m2n_pg is None
@@ -1425,6 +1476,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         ):
             return
         m2n = _nccl_rl()
+        manifest = self._m2n_manifest if manifest is None else manifest
         stream = torch.cuda.current_stream()
 
         def placements(descriptors: Sequence[Mapping[str, Any]]) -> list[Any]:
@@ -1439,9 +1491,15 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             return result
 
         try:
-            for entry in self._m2n_manifest["entries"]:
+            previous_source_mesh = None
+            for entry in manifest["entries"]:
                 source_descriptor = entry["source"]
                 destination_descriptor = entry["destination"]
+                if previous_source_mesh is not None and source_descriptor["mesh"] != previous_source_mesh:
+                    # Match the receiver's handoff when dense/expert ownership
+                    # changes inside this PP stage's communicator.
+                    dist.barrier(group=self._m2n_pg)
+                previous_source_mesh = source_descriptor["mesh"]
                 source = None
                 if any(self._m2n_comm_rank in row for row in source_descriptor["mesh"]):
                     source = self._source_tensor(entry)
@@ -1471,63 +1529,78 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         finally:
             self._m2n_fp8_pair_cache.clear()
 
-    def _update_bulk_weights(self) -> bool:
-        if self._m2n_manifest is None or self._m2n_group_name is None:
-            raise RuntimeError("NCCL M2N updater is not connected")
+    def _update_m2n_stage(self, pp_rank: int, manifest: Mapping[str, Any]) -> None:
+        group_name = self._m2n_group_names[pp_rank]
         refs = []
-        lock_acquired = False
         startup_error: str | None = None
+        if dist.get_rank() == 0:
+            try:
+                for engine in self.rollout_engines:
+                    refs.append(
+                        engine.update_weights_from_distributed.remote(
+                            names=[entry["name"] for entry in manifest["entries"]],
+                            dtypes=[_dtype_from_name(entry["dtype"]) for entry in manifest["entries"]],
+                            shapes=[entry["global_shape"] for entry in manifest["entries"]],
+                            group_name=group_name,
+                            load_format="nccl_m2n",
+                        )
+                    )
+            except Exception as exc:
+                startup_error = f"trainer rank 0 PP={pp_rank} M2N startup: {type(exc).__name__}: {exc}"
+        startup_failures = _collect_errors(startup_error)
+        if startup_failures:
+            raise RuntimeError("NCCL M2N update startup failed: " + " | ".join(startup_failures))
+
+        local_error: str | None = None
+        # Other PP stages do not enter this NCCL communicator at all.
+        if self._m2n_group_name == group_name:
+            try:
+                self._run_m2n_batch(manifest)
+            except Exception as exc:
+                local_error = f"trainer rank {dist.get_rank()} M2N transfer: {type(exc).__name__}: {exc}"
+        if dist.get_rank() == 0:
+            try:
+                _check_engine_results(ray.get(refs), f"PP={pp_rank} M2N weight update")
+            except Exception as exc:
+                remote_error = f"SGLang M2N transfer: {type(exc).__name__}: {exc}"
+                local_error = f"{local_error}; {remote_error}" if local_error else remote_error
+        failures = _collect_errors(local_error)
+        if failures:
+            raise RuntimeError(f"NCCL M2N PP={pp_rank} weight update failed: " + " | ".join(failures))
+
+    def _update_bulk_weights(self) -> bool:
+        if self._m2n_manifest is None or not self._m2n_group_names:
+            raise RuntimeError("NCCL M2N updater is not connected")
+        lock_acquired = False
+        local_error: str | None = None
         if dist.get_rank() == 0:
             try:
                 while not ray.get(self.rollout_engine_lock.acquire.remote()):
                     time.sleep(0.1)
                 lock_acquired = True
-                refs = [
-                    engine.update_weights_from_distributed.remote(
-                        names=[entry["name"] for entry in self._m2n_manifest["entries"]],
-                        dtypes=[_dtype_from_name(entry["dtype"]) for entry in self._m2n_manifest["entries"]],
-                        shapes=[entry["global_shape"] for entry in self._m2n_manifest["entries"]],
-                        group_name=self._m2n_group_name,
-                        load_format="nccl_m2n",
-                    )
-                    for engine in self.rollout_engines
-                ]
             except Exception as exc:
-                startup_error = f"trainer rank 0 M2N startup: {type(exc).__name__}: {exc}"
-
-        startup_failures = _collect_errors(startup_error)
-        if startup_failures:
-            if dist.get_rank() == 0 and lock_acquired:
-                ray.get(self.rollout_engine_lock.release.remote())
-            raise RuntimeError("NCCL M2N update startup failed: " + " | ".join(startup_failures))
-
-        local_error: str | None = None
+                local_error = f"rollout-engine lock acquire: {type(exc).__name__}: {exc}"
+        startup_failures = _collect_errors(local_error)
         try:
-            self._run_m2n_batch()
+            if startup_failures:
+                raise RuntimeError("NCCL M2N update startup failed: " + " | ".join(startup_failures))
+            # Keep the existing sequential refit schedule. Distinct native
+            # communicators isolate both staging memory and signal state; PP
+            # overlap is a separate optimization, not required for correctness.
+            for pp_rank, manifest in self._m2n_stage_manifests.items():
+                self._update_m2n_stage(pp_rank, manifest)
         except Exception as exc:
-            local_error = f"trainer rank {dist.get_rank()} M2N transfer: " f"{type(exc).__name__}: {exc}"
-
-        if dist.get_rank() == 0:
-            try:
-                _check_engine_results(ray.get(refs), "M2N weight update")
-            except Exception as exc:
-                local_error = (
-                    f"SGLang M2N transfer: {type(exc).__name__}: {exc}"
-                    if local_error is None
-                    else f"{local_error}; SGLang M2N transfer: " f"{type(exc).__name__}: {exc}"
-                )
-            try:
-                if lock_acquired:
+            local_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if dist.get_rank() == 0 and lock_acquired:
+                try:
                     ray.get(self.rollout_engine_lock.release.remote())
-            except Exception as exc:
-                local_error = (
-                    f"rollout-engine lock release: {type(exc).__name__}: {exc}"
-                    if local_error is None
-                    else f"{local_error}; rollout-engine lock release: " f"{type(exc).__name__}: {exc}"
-                )
-
+                except Exception as exc:
+                    release_error = f"rollout-engine lock release: {type(exc).__name__}: {exc}"
+                    local_error = f"{local_error}; {release_error}" if local_error else release_error
         failures = _collect_errors(local_error)
         if failures:
+            self._connection_stale = True
             raise RuntimeError("NCCL M2N weight update failed: " + " | ".join(failures))
 
         if dist.get_rank() == 0:
