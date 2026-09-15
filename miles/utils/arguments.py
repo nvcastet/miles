@@ -894,6 +894,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--m2n-pp-concurrency",
+                type=int,
+                default=2,
+                help=(
+                    "Maximum trainer PP stages transferred concurrently by nccl-m2n. "
+                    "Each stage retains its own communicator and rollout CUDA stream. "
+                    "Set to 1 for sequential PP updates."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-disk-dir",
                 type=str,
                 default=None,
@@ -2855,6 +2865,7 @@ def _resolve_mini_ft_controller_enable(args: argparse.Namespace) -> bool:
     return bool(args.ft_components) and args.api_server_port != 0
 
 def _validate_nccl_m2n_args(args):
+    assert getattr(args, "m2n_pp_concurrency", 2) > 0, "--m2n-pp-concurrency must be a positive integer."
     assert not args.colocate, (
         "NCCL M2N weight transfer requires disaggregated trainer and rollout GPUs; "
         "disable --colocate."

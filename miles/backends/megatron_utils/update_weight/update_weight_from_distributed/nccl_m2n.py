@@ -1530,7 +1530,16 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             self._m2n_fp8_pair_cache.clear()
 
     def _update_m2n_stage(self, pp_rank: int, manifest: Mapping[str, Any]) -> None:
-        group_name = self._m2n_group_names[pp_rank]
+        self._update_m2n_stages({pp_rank: manifest})
+
+    def _update_m2n_stages(self, stages: Mapping[int, Mapping[str, Any]]) -> None:
+        """Run one bounded wave; every trainer joins only its own PP group."""
+        group_names = [self._m2n_group_names[pp_rank] for pp_rank in stages]
+        entries = [entry for manifest in stages.values() for entry in manifest["entries"]]
+        stage_label = ",".join(str(pp_rank) for pp_rank in stages)
+        # A single scheduler request must drive every receiver in this wave.
+        # Independent HTTP requests serialize inside SGLang's update lock.
+        batch_kwargs = {"m2n_group_names": group_names} if len(group_names) > 1 else {}
         refs = []
         startup_error: str | None = None
         if dist.get_rank() == 0:
@@ -1538,39 +1547,46 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
                 for engine in self.rollout_engines:
                     refs.append(
                         engine.update_weights_from_distributed.remote(
-                            names=[entry["name"] for entry in manifest["entries"]],
-                            dtypes=[_dtype_from_name(entry["dtype"]) for entry in manifest["entries"]],
-                            shapes=[entry["global_shape"] for entry in manifest["entries"]],
-                            group_name=group_name,
+                            names=[entry["name"] for entry in entries],
+                            dtypes=[_dtype_from_name(entry["dtype"]) for entry in entries],
+                            shapes=[entry["global_shape"] for entry in entries],
+                            group_name=group_names[0],
                             load_format="nccl_m2n",
+                            **batch_kwargs,
                         )
                     )
             except Exception as exc:
-                startup_error = f"trainer rank 0 PP={pp_rank} M2N startup: {type(exc).__name__}: {exc}"
+                startup_error = f"trainer rank 0 PP={stage_label} M2N startup: {type(exc).__name__}: {exc}"
         startup_failures = _collect_errors(startup_error)
         if startup_failures:
             raise RuntimeError("NCCL M2N update startup failed: " + " | ".join(startup_failures))
 
         local_error: str | None = None
-        # Other PP stages do not enter this NCCL communicator at all.
-        if self._m2n_group_name == group_name:
-            try:
-                self._run_m2n_batch(manifest)
-            except Exception as exc:
-                local_error = f"trainer rank {dist.get_rank()} M2N transfer: {type(exc).__name__}: {exc}"
+        # All selected stages start together, without a trainer-wide collective
+        # between them. A trainer belongs to exactly one stage communicator.
+        for pp_rank, manifest in stages.items():
+            if self._m2n_group_name == self._m2n_group_names[pp_rank]:
+                try:
+                    self._run_m2n_batch(manifest)
+                except Exception as exc:
+                    local_error = f"trainer rank {dist.get_rank()} M2N transfer: {type(exc).__name__}: {exc}"
+                break
         if dist.get_rank() == 0:
             try:
-                _check_engine_results(ray.get(refs), f"PP={pp_rank} M2N weight update")
+                _check_engine_results(ray.get(refs), f"PP={stage_label} M2N weight update")
             except Exception as exc:
                 remote_error = f"SGLang M2N transfer: {type(exc).__name__}: {exc}"
                 local_error = f"{local_error}; {remote_error}" if local_error else remote_error
         failures = _collect_errors(local_error)
         if failures:
-            raise RuntimeError(f"NCCL M2N PP={pp_rank} weight update failed: " + " | ".join(failures))
+            raise RuntimeError(f"NCCL M2N PP={stage_label} weight update failed: " + " | ".join(failures))
 
     def _update_bulk_weights(self) -> bool:
         if self._m2n_manifest is None or not self._m2n_group_names:
             raise RuntimeError("NCCL M2N updater is not connected")
+        concurrency = getattr(self.args, "m2n_pp_concurrency", 2)
+        if not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("--m2n-pp-concurrency must be a positive integer")
         lock_acquired = False
         local_error: str | None = None
         if dist.get_rank() == 0:
@@ -1584,11 +1600,22 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         try:
             if startup_failures:
                 raise RuntimeError("NCCL M2N update startup failed: " + " | ".join(startup_failures))
-            # Keep the existing sequential refit schedule. Distinct native
-            # communicators isolate both staging memory and signal state; PP
-            # overlap is a separate optimization, not required for correctness.
-            for pp_rank, manifest in self._m2n_stage_manifests.items():
-                self._update_m2n_stage(pp_rank, manifest)
+            stages = sorted(self._m2n_stage_manifests.items())
+            for start in range(0, len(stages), concurrency):
+                wave = dict(stages[start : start + concurrency])
+                started = time.perf_counter()
+                if len(wave) == 1:
+                    pp_rank, manifest = next(iter(wave.items()))
+                    self._update_m2n_stage(pp_rank, manifest)
+                else:
+                    self._update_m2n_stages(wave)
+                if dist.get_rank() == 0:
+                    logger.info(
+                        "NCCL M2N PP wave=%s concurrency=%d elapsed=%.3fs",
+                        list(wave),
+                        concurrency,
+                        time.perf_counter() - started,
+                    )
         except Exception as exc:
             local_error = f"{type(exc).__name__}: {exc}"
         finally:

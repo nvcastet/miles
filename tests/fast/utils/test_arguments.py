@@ -724,11 +724,18 @@ def test_nccl_m2n_accepts_derived_reduced_and_full_topologies(args):
         ({"rollout_num_gpus": 3}, "must be divisible"),
         ({"sglang_ep_size": 0}, "positive rollout EP"),
         ({"sglang_pp_size": 2}, "rollout PP=1 and DP=1"),
+        ({"m2n_pp_concurrency": 0}, "m2n-pp-concurrency"),
+        ({"m2n_pp_concurrency": -1}, "m2n-pp-concurrency"),
     ],
 )
 def test_nccl_m2n_rejects_inconsistent_topologies(overrides, message):
     with pytest.raises(AssertionError, match=message):
         _validate_nccl_m2n_args(_m2n_args(**overrides))
+
+
+@pytest.mark.parametrize("concurrency", [1, 2, 8])
+def test_nccl_m2n_accepts_positive_pp_concurrency(concurrency):
+    _validate_nccl_m2n_args(_m2n_args(m2n_pp_concurrency=concurrency))
 
 
 class TestTitoFixedTemplateConfiguration:
