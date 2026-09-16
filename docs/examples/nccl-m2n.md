@@ -1,5 +1,8 @@
-# Small NCCL M2N example
-
+---
+title: "Small NCCL M2N example"
+description: "Four-GPU smoke example for M2N weight refits, concurrent trainer PP stages, and residual broadcasts."
+# Generated from examples/nccl_m2n/README.md by scripts/tools/sync_example_docs.py. Edit that README, not this file.
+---
 Qwen3-0.6B in BF16 on **four allocated GPUs on one node**, including GB300:
 two trainer GPUs (TP1/PP2) and two separate rollout GPUs (one TP2 engine).
 This exercises PP ownership, concurrent refits, dense resharding, residual

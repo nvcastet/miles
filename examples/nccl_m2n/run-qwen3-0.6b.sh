@@ -5,7 +5,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MILES_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-source "${MILES_ROOT}/scripts/models/qwen3-0.6B.sh"
+# Preserve this example's externally managed Ray lifecycle.
+MODEL_ARGS_TEXT="$(python3 "${MILES_ROOT}/miles/utils/external_utils/model_args_utils.py" qwen3-0.6B)"
+read -r -a MODEL_ARGS <<< "${MODEL_ARGS_TEXT}"
 
 : "${HF_CHECKPOINT:?Set HF_CHECKPOINT to the local Qwen3-0.6B directory}"
 : "${TRAIN_CHECKPOINT:?Set TRAIN_CHECKPOINT to its converted torch_dist checkpoint}"
