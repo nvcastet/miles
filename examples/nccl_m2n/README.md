@@ -15,6 +15,11 @@ the `nccl.m2n` Python package. Installing the Python package alone is insufficie
 Configure native-library paths before starting Ray. All commands below run from
 the Miles repository in Bash.
 
+With `--update-weight-transfer-mode nccl-m2n`, Miles sets `NCCL_CUMEM_ENABLE=1`
+in both trainer and SGLang worker environments before the processes start.
+This overrides a conflicting `0`; NCCL M2N requires cuMem. Broadcast behavior
+is unchanged.
+
 ```bash
 export MEGATRON_PATH=/root/Megatron-LM
 export HF_CHECKPOINT=/root/models/Qwen3-0.6B
