@@ -2,14 +2,17 @@
 
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
 
-from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import nccl_m2n
-from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.nccl_m2n import (
+from miles.backends.training_utils.weight_update.protocols import nccl_m2n
+from miles.backends.training_utils.weight_update.protocols import nccl_m2n_manifest as manifest_utils
+from miles.backends.training_utils.weight_update.protocols.nccl_m2n import (
     UpdateWeightFromNcclM2N,
+)
+from miles.backends.training_utils.weight_update.protocols.nccl_m2n_manifest import (
     _build_manifest,
     _split_manifest_by_pp,
 )
@@ -91,7 +94,7 @@ def test_manifest_ownership_shards_replicas_and_fp8_pairs(fp8, ep):
         assert stage["source_world_ranks"] == list(range(4 * pp, 4 * pp + 4))
         assert stage["trainer_world_to_comm_rank"] == {str(4 * pp + rank): rank for rank in range(4)}
         assert stage["communicator_world_size"] == 8
-        assert stage["manifest_hash"] == nccl_m2n._manifest_digest(stage)
+        assert stage["manifest_hash"] == manifest_utils._manifest_digest(stage)
         for entry in stage["entries"]:
             assert entry["pp_rank"] == pp
             layer = int(entry["name"].split(".")[2])
@@ -107,7 +110,7 @@ def test_manifest_ownership_shards_replicas_and_fp8_pairs(fp8, ep):
             shape[dim] //= 2
             assert entry["destination"]["local_shape"] == shape
         if fp8:
-            nccl_m2n._validate_fp8_pairs(stage["entries"])
+            manifest_utils._validate_fp8_pairs(stage["entries"])
             assert stage["quantization"]["scale_format"] == "canonical"
             pairs = {}
             for entry in stage["entries"]:
@@ -118,7 +121,7 @@ def test_manifest_ownership_shards_replicas_and_fp8_pairs(fp8, ep):
                 assert scale["global_shape"] == [weight["global_shape"][0], 2, 2]
                 assert scale["source"]["names_by_rank"] == weight["source"]["names_by_rank"]
             with pytest.raises(ValueError):
-                nccl_m2n._validate_fp8_pairs(stage["entries"][:-1])
+                manifest_utils._validate_fp8_pairs(stage["entries"][:-1])
 
 
 @pytest.mark.parametrize("fp8,family", [(False, "dense"), (False, "routed_expert"), (True, "routed_expert")])
@@ -167,6 +170,7 @@ def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused():
     updater._m2n_pg = object()
     updater._m2n_comm_ptr = 123
     updater._m2n_comm_rank = 0
+    updater._source_device = "cpu"
     updater._m2n_local_tensors = {source_name: fused_fc1}
     updater._m2n_fp8_pair_cache = {}
 
@@ -241,11 +245,13 @@ def test_concurrent_wave_dispatches_one_rpc_and_only_local_selected_stage(local_
     updater._m2n_group_names = {stage: f"pp-{stage}" for stage in stages}
     updater._m2n_group_name = f"pp-{local_pp}"
     updater._run_m2n_batch = Mock()
+    updater._selector = "all"
     updater.rollout_engines = [Mock(), Mock()]
     with (
         patch.object(nccl_m2n.dist, "get_rank", return_value=4 * local_pp),
         patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
-        patch.object(nccl_m2n.ray, "get", return_value=[{"success": True}] * 2),
+        patch.object(nccl_m2n.async_utils, "submit"),
+        patch.object(nccl_m2n.async_utils, "wait_futures", return_value=[{"success": True}] * 2),
     ):
         updater._update_m2n_stages(wave)
     if local_pp in wave:
@@ -254,10 +260,10 @@ def test_concurrent_wave_dispatches_one_rpc_and_only_local_selected_stage(local_
         updater._run_m2n_batch.assert_not_called()
     for engine in updater.rollout_engines:
         if local_pp != 0:
-            engine.update_weights_from_distributed.remote.assert_not_called()
+            engine.update_weights_from_distributed.assert_not_called()
             continue
-        engine.update_weights_from_distributed.remote.assert_called_once()
-        payload = engine.update_weights_from_distributed.remote.call_args.kwargs
+        engine.update_weights_from_distributed.assert_called_once()
+        payload = engine.update_weights_from_distributed.call_args.kwargs
         assert payload["group_name"] == "pp-0"
         assert payload["m2n_group_names"] == ["pp-0", "pp-1"]
         assert payload["names"] == [entry["name"] for stage in wave.values() for entry in stage["entries"]]
@@ -270,7 +276,7 @@ def test_pp_waves_cover_uneven_tail_and_stop_on_failure(concurrency, fail):
     updater._m2n_manifest = {"entries": []}
     updater._m2n_group_names = {stage: f"pp-{stage}" for stage in range(5)}
     updater._m2n_stage_manifests = {stage: {} for stage in range(5)}
-    updater.rollout_engine_lock = Mock()
+    updater._engine_lock = MagicMock()
     waves = []
 
     def dispatch(stages):
@@ -283,18 +289,16 @@ def test_pp_waves_cover_uneven_tail_and_stop_on_failure(concurrency, fail):
     with (
         patch.object(nccl_m2n.dist, "get_rank", return_value=0),
         patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
-        patch.object(nccl_m2n.ray, "get", return_value=True),
     ):
         if fail:
             with pytest.raises(RuntimeError, match="wave failure"):
                 updater._update_bulk_weights()
             assert waves == [[0, 1]]
-            assert updater._connection_stale is True
         else:
             assert updater._update_bulk_weights() is True
             assert waves == [list(range(start, min(start + concurrency, 5))) for start in range(0, 5, concurrency)]
-    updater.rollout_engine_lock.acquire.remote.assert_called_once()
-    updater.rollout_engine_lock.release.remote.assert_called_once()
+    updater._engine_lock.__enter__.assert_called_once()
+    updater._engine_lock.__exit__.assert_called_once_with(None, None, None)
 
 
 def test_sender_orders_dense_expert_source_handoffs_inside_one_pp_group():
@@ -326,3 +330,92 @@ def test_sender_orders_dense_expert_source_handoffs_inside_one_pp_group():
     assert events == expected
     assert barrier.call_count > 0
     assert all(invocation.kwargs["group"] is updater._m2n_pg for invocation in barrier.call_args_list)
+
+
+@pytest.mark.parametrize("mode", ["raw", "bridge"])
+def test_nccl_m2n_refreshes_source_mapping_and_omits_atomic_residual_units(mode):
+    from miles.backends.training_utils.weight_update.hf_weight_iterator import HfWeightIteratorBase
+
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater.args = SimpleNamespace(megatron_to_hf_mode=mode)
+    iterator = SimpleNamespace(model=[], quantization_config=None)
+    native = "module.module.decoder.layers.2.mlp.linear_fc1.weight"
+    local = "vp_stages.0.decoder.layers.0.mlp.linear_fc1.weight"
+    with patch.object(
+        nccl_m2n,
+        "named_params_and_buffers",
+        side_effect=lambda *a, **k: [(native if k.get("convert_to_global_name", True) else local, torch.zeros(1))],
+    ):
+        updater.configure_model(iterator)
+    updater._m2n_local_tensors = {native: torch.zeros(1)}
+    updater._update_bulk_weights = Mock()
+    with patch.object(nccl_m2n, "_collect_errors", return_value=[]):
+        for value in (1, 2):
+            current = torch.full((1,), value)
+            updater.before_base_weights({native if mode == "raw" else local: current})
+            assert updater._m2n_local_tensors[native] is current
+    assert updater._update_bulk_weights.call_count == 2
+
+    iterator.excluded_hf_names = {"gate.weight", "up.weight"}
+    routed = [("gate.weight", torch.zeros(1)), ("up.weight", torch.zeros(1))]
+    residual = [("attention.weight", torch.zeros(1))]
+    assert list(HfWeightIteratorBase._residual_units(iterator, [routed, residual])) == [residual]
+    with pytest.raises(RuntimeError, match="atomic"):
+        list(HfWeightIteratorBase._residual_units(iterator, [routed + residual]))
+
+
+def test_nccl_m2n_async_api_payload_and_strict_teardown():
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
+
+    client = SGLangApiClient("http://unused")
+    request = AsyncMock(return_value={"success": True})
+
+    async def exercise():
+        with patch.object(SGLangApiClient, "_make_request", request):
+            await client.init_weights_update_group("host", 123, 2, 4, "pp0", "nccl", m2n_manifest={"entries": []})
+            assert request.call_args.args[1]["m2n_manifest"] == {"entries": []}
+            await client.update_weights_from_distributed(
+                ["w"],
+                [torch.bfloat16],
+                [[1]],
+                "pp0",
+                load_format="nccl_m2n",
+                m2n_group_names=["pp0", "pp1"],
+            )
+            payload = request.call_args.args[1]
+            assert payload["load_format"] == "nccl_m2n"
+            assert payload["m2n_group_names"] == ["pp0", "pp1"]
+            assert payload["dtypes"] == ["bfloat16"]
+            request.side_effect = httpx.ConnectError("offline")
+            with pytest.raises(httpx.ConnectError):
+                await client.destroy_weights_update_group("pp0", strict=True)
+            await client.destroy_weights_update_group("pp0")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_nccl_m2n_session_failure_is_collective_and_marks_connection_stale(rank):
+    from miles.backends.training_utils.conn_status import ConnStatusManager
+    from miles.backends.training_utils.weight_update import updater as updater_module
+
+    protocol = object.__new__(UpdateWeightFromNcclM2N)
+    operation = Mock(side_effect=RuntimeError("prepare failed"))
+    updater = object.__new__(updater_module.WeightUpdater)
+    updater.conn_status = ConnStatusManager()
+    updater.conn_status.mark_reconnected({})
+    updater._update_weights = lambda: protocol.run_engine_session(operation)
+    with (
+        patch.object(nccl_m2n.dist, "get_rank", return_value=rank),
+        patch.object(nccl_m2n, "_collect_errors", return_value=["prepare failed"]) as collect,
+    ):
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            updater.update_weights()
+    assert updater.conn_status.needs_reconnect({})
+    assert operation.call_count == int(rank == 0)
+    assert (collect.call_args.args[0] is None) is (rank != 0)
