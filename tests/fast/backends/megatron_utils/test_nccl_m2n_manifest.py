@@ -9,9 +9,7 @@ import torch
 
 from miles.backends.training_utils.weight_update.protocols import nccl_m2n
 from miles.backends.training_utils.weight_update.protocols import nccl_m2n_manifest as manifest_utils
-from miles.backends.training_utils.weight_update.protocols.nccl_m2n import (
-    UpdateWeightFromNcclM2N,
-)
+from miles.backends.training_utils.weight_update.protocols.nccl_m2n import UpdateWeightFromNcclM2N
 from miles.backends.training_utils.weight_update.protocols.nccl_m2n_manifest import (
     _build_manifest,
     _split_manifest_by_pp,
