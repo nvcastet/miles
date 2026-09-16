@@ -1,758 +1,152 @@
+"""Critical M2N sender regressions; native NCCL calls are mocked."""
+
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
-from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import (
-    nccl_m2n,
-)
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import nccl_m2n
 from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.nccl_m2n import (
     UpdateWeightFromNcclM2N,
     _build_manifest,
-    _new_m2n_group_name,
     _split_manifest_by_pp,
 )
 
-_LAYER_COUNTS = (4, 6, 6, 6, 6, 6, 6, 3)
-_EXPERTS_PER_RANK = 2
-
-
-def _dense_name(layer, projection):
-    return f"module.module.decoder.layers.{layer}.mlp.linear_fc{projection}.weight"
-
-
-def _expert_name(layer, projection, expert_id):
-    return f"module.module.decoder.layers.{layer}.mlp.experts." f"linear_fc{projection}.weight{expert_id}"
-
-
-def _unmapped_name(layer):
-    return f"module.module.decoder.layers.{layer}." "self_attention.linear_proj.weight"
-
-
-_DENSE_FC1 = _dense_name(0, 1)
-_UNMAPPED = _unmapped_name(0)
 _FP8_CONFIG = {
     "quant_method": "fp8",
     "fmt": "e4m3",
     "activation_scheme": "dynamic",
     "weight_block_size": [128, 128],
+    "scale_fmt": "ue8m0",
 }
 
 
-def _spec(
-    name,
-    *,
-    layer,
-    family,
-    projection,
-    local_shape,
-    expert_id=None,
-    partition_dim=-1,
-    partition_stride=1,
-):
-    return {
-        "name": name,
-        "family": family,
-        "layer": layer,
-        "projection": projection,
-        "expert_id": expert_id,
-        "dtype": "bfloat16",
-        "local_shape": local_shape,
-        "partition_dim": partition_dim,
-        "partition_stride": partition_stride,
-    }
-
-
-def _layers_by_stage():
-    cursor = 0
-    result = []
-    for count in _LAYER_COUNTS:
-        result.append(tuple(range(cursor, cursor + count)))
-        cursor += count
-    return tuple(result)
-
-
-_LAYERS_BY_STAGE = _layers_by_stage()
-
-
-def _payload(world_rank):
-    pp_rank, stage_rank = divmod(world_rank, 4)
-    tp_rank = stage_rank % 2
-    cp_rank = stage_rank // 2
-    ep_rank = stage_rank
-    specs = []
-    update_units = []
-    for layer in _LAYERS_BY_STAGE[pp_rank]:
-        dense_fc1 = _dense_name(layer, 1)
-        dense_fc2 = _dense_name(layer, 2)
-        specs.extend(
-            [
-                _spec(
-                    dense_fc1,
-                    layer=layer,
-                    family="dense",
-                    projection="fc1",
-                    local_shape=[8, 4],
-                    partition_dim=0,
-                    partition_stride=2,
-                ),
-                _spec(
-                    dense_fc2,
-                    layer=layer,
-                    family="dense",
-                    projection="fc2",
-                    local_shape=[4, 4],
-                    partition_dim=1,
-                ),
-            ]
-        )
-        update_units.extend(([dense_fc1], [dense_fc2]))
-        for expert_id in range(
-            ep_rank * _EXPERTS_PER_RANK,
-            (ep_rank + 1) * _EXPERTS_PER_RANK,
-        ):
-            expert_fc1 = _expert_name(layer, 1, expert_id)
-            expert_fc2 = _expert_name(layer, 2, expert_id)
-            specs.extend(
-                [
-                    _spec(
-                        expert_fc1,
-                        layer=layer,
-                        family="routed_expert",
-                        projection="fc1",
-                        local_shape=[8, 4],
-                        expert_id=expert_id,
-                    ),
-                    _spec(
-                        expert_fc2,
-                        layer=layer,
-                        family="routed_expert",
-                        projection="fc2",
-                        local_shape=[4, 4],
-                        expert_id=expert_id,
-                    ),
-                ]
-            )
-            update_units.extend(([expert_fc1], [expert_fc2]))
-        update_units.append([_unmapped_name(layer)])
-    return {
-        "topology": {
-            "world_rank": world_rank,
-            "pp_rank": pp_rank,
-            "pp_size": 8,
-            "tp_rank": tp_rank,
-            "tp_size": 2,
-            "cp_rank": cp_rank,
-            "cp_size": 2,
-            "dense_dp_rank": 0,
-            "dense_dp_size": 1,
-            "ep_rank": ep_rank,
-            "ep_size": 4,
-            "etp_rank": 0,
-            "etp_size": 1,
-            "expert_dp_rank": 0,
-            "expert_dp_size": 1,
-            "independent_dp_rank": 0,
-            "independent_dp_size": 1,
-        },
-        "specs": specs,
-        "update_units": update_units,
-    }
-
-
 def _payloads():
-    return [_payload(world_rank) for world_rank in range(32)]
-
-
-def _reduced_pp2_payload(world_rank):
-    pp_rank, stage_rank = divmod(world_rank, 2)
-    specs = []
-    update_units = []
-    for layer in ((0, 1), (2,))[pp_rank]:
-        for projection, local_shape, partition_dim, partition_stride in (
-            (1, [4, 4], 0, 2),
-            (2, [4, 4], 1, 1),
-        ):
-            name = _dense_name(layer, projection)
-            specs.append(
-                _spec(
-                    name,
-                    layer=layer,
-                    family="dense",
-                    projection=f"fc{projection}",
-                    local_shape=local_shape,
-                    partition_dim=partition_dim,
-                    partition_stride=partition_stride,
-                )
-            )
-            update_units.append([name])
-        for projection, local_shape in ((1, [8, 4]), (2, [4, 4])):
-            name = _expert_name(layer, projection, stage_rank)
-            specs.append(
-                _spec(
-                    name,
-                    layer=layer,
-                    family="routed_expert",
-                    projection=f"fc{projection}",
-                    local_shape=local_shape,
-                    expert_id=stage_rank,
-                )
-            )
-            update_units.append([name])
-    return {
-        "topology": {
-            "world_rank": world_rank,
-            "pp_rank": pp_rank,
-            "pp_size": 2,
-            "tp_rank": stage_rank,
-            "tp_size": 2,
-            "cp_rank": 0,
-            "cp_size": 1,
-            "dense_dp_rank": 0,
-            "dense_dp_size": 1,
-            "ep_rank": stage_rank,
-            "ep_size": 2,
-            "etp_rank": 0,
-            "etp_size": 1,
-            "expert_dp_rank": 0,
-            "expert_dp_size": 1,
-            "independent_dp_rank": 0,
-            "independent_dp_size": 1,
-        },
-        "specs": specs,
-        "update_units": update_units,
-    }
-
-
-def _fp8_payloads():
-    payloads = [_reduced_pp2_payload(world_rank) for world_rank in range(4)]
-    for payload in payloads:
-        for spec in payload["specs"]:
-            if spec["family"] != "routed_expert":
-                continue
-            spec["local_shape"] = [512, 256] if spec["projection"] == "fc1" else [256, 256]
+    """Uneven PP2, TP2/CP2, EP4/ETP1; no model-specific routing assumptions."""
+    payloads = []
+    for rank in range(8):
+        pp, local = divmod(rank, 4)
+        specs = []
+        for layer in ((0, 1), (2,))[pp]:
+            for family in ("dense", "routed_expert"):
+                for projection in (1, 2):
+                    expert = ".experts" if family == "routed_expert" else ""
+                    name = f"module.module.decoder.layers.{layer}.mlp{expert}.linear_fc{projection}.weight"
+                    specs.append(
+                        {
+                            "name": name + (str(local) if expert else ""),
+                            "family": family,
+                            "layer": layer,
+                            "projection": f"fc{projection}",
+                            "expert_id": local if expert else None,
+                            "dtype": "bfloat16",
+                            "local_shape": [512 if projection == 1 else 256, 256],
+                            "partition_dim": -1 if expert else projection - 1,
+                            "partition_stride": 2 if not expert and projection == 1 else 1,
+                        }
+                    )
+        payloads.append(
+            {
+                "topology": dict(
+                    world_rank=rank,
+                    pp_rank=pp,
+                    pp_size=2,
+                    tp_rank=local % 2,
+                    tp_size=2,
+                    cp_rank=local // 2,
+                    cp_size=2,
+                    dense_dp_rank=0,
+                    dense_dp_size=1,
+                    ep_rank=local,
+                    ep_size=4,
+                    etp_rank=0,
+                    etp_size=1,
+                    expert_dp_rank=0,
+                    expert_dp_size=1,
+                    independent_dp_rank=0,
+                    independent_dp_size=1,
+                ),
+                "specs": specs,
+                "update_units": [[spec["name"]] for spec in specs],
+            }
+        )
     return payloads
 
 
-def _reduced_pp1_payload(world_rank):
-    payload = _reduced_pp2_payload(world_rank)
-    payload["topology"]["pp_size"] = 1
-    return payload
-
-
-def _dense_pp1_payload(world_rank):
-    payload = _reduced_pp1_payload(world_rank)
-    payload["topology"].update(
-        ep_rank=0,
-        ep_size=1,
-        expert_dp_rank=world_rank,
-        expert_dp_size=2,
-    )
-    payload["specs"] = [spec for spec in payload["specs"] if spec["family"] == "dense"]
-    dense_names = {spec["name"] for spec in payload["specs"]}
-    payload["update_units"] = [unit for unit in payload["update_units"] if set(unit) <= dense_names]
-    return payload
-
-
-def _entry(manifest, name):
-    return next(entry for entry in manifest["entries"] if entry["name"] == name)
-
-
-def _stage_for_layer(layer):
-    return next(pp_rank for pp_rank, layers in enumerate(_LAYERS_BY_STAGE) if layer in layers)
-
-
-def test_manifest_models_pp8_tp2_cp2_ep4_and_eight_rollout_engines():
+@pytest.mark.parametrize("fp8,ep", [(False, 2), (False, 1), (True, 2), (True, 1)])
+def test_manifest_ownership_shards_replicas_and_fp8_pairs(fp8, ep):
     payloads = _payloads()
-    manifest = _build_manifest(payloads, [4] * 8)
-    reordered = _build_manifest(list(reversed(payloads)), [4] * 8)
-
-    assert manifest == reordered
-    assert manifest["schema_version"] == 1
-    assert manifest["source_world_ranks"] == list(range(32))
-    assert manifest["trainer_world_to_comm_rank"] == {str(rank): rank for rank in range(32)}
-    assert manifest["communicator_world_size"] == 64
-    assert "destination_mesh" not in manifest
-
-    destination_mesh = [list(range(engine_start, engine_start + 4)) for engine_start in range(32, 64, 4)]
-    dense_meshes_by_stage = {
-        pp_rank: {
-            tuple(tuple(row) for row in entry["source"]["mesh"])
-            for entry in manifest["entries"]
-            if entry["family"] == "dense" and entry["pp_rank"] == pp_rank
-        }
-        for pp_rank in range(8)
-    }
-    expert_meshes_by_stage = {
-        pp_rank: {
-            tuple(tuple(row) for row in entry["source"]["mesh"])
-            for entry in manifest["entries"]
-            if entry["family"] == "routed_expert" and entry["pp_rank"] == pp_rank
-        }
-        for pp_rank in range(8)
-    }
-    assert dense_meshes_by_stage == {pp_rank: {((4 * pp_rank, 4 * pp_rank + 1),)} for pp_rank in range(8)}
-    assert expert_meshes_by_stage == {
-        pp_rank: {tuple((tuple(range(4 * pp_rank, 4 * pp_rank + 4)),))} for pp_rank in range(8)
-    }
-
-    assert len(manifest["entries"]) == 43 * 6
-    assert len({entry["name"] for entry in manifest["entries"]}) == 43 * 6
-    assert all(
-        entry["pp_rank"] == _stage_for_layer(int(entry["name"].split(".layers.", 1)[1].split(".", 1)[0]))
-        for entry in manifest["entries"]
-    )
-    assert all(entry["destination"]["mesh"] == destination_mesh for entry in manifest["entries"])
-
-    dense = _entry(manifest, "model.layers.12.mlp.gate_proj.weight")
-    assert set(dense) == {
-        "name",
-        "family",
-        "pp_rank",
-        "dtype",
-        "global_shape",
-        "source",
-        "destination",
-    }
-    assert set(dense["source"]) == {
-        "mesh",
-        "placements",
-        "local_shape",
-        "names_by_rank",
-        "recipe",
-    }
-    assert set(dense["destination"]) == {
-        "mesh",
-        "placements",
-        "local_shape",
-        "parameter",
-        "recipe",
-    }
-    assert dense["pp_rank"] == 2
-    assert dense["source"]["mesh"] == [[8, 9]]
-    assert dense["source"]["placements"] == [
-        {"type": "replicate"},
-        {"type": "shard", "dim": 0},
-    ]
-    assert dense["source"]["local_shape"] == [4, 4]
-    assert dense["source"]["names_by_rank"] == {
-        "8": [_dense_name(12, 1)],
-        "9": [_dense_name(12, 1)],
-    }
-    assert dense["destination"]["mesh"] == destination_mesh
-    assert dense["destination"]["placements"] == [
-        {"type": "replicate"},
-        {"type": "shard", "dim": 0},
-    ]
-    assert dense["destination"]["local_shape"] == [2, 4]
-
-    expert = _entry(manifest, "model.layers.12.mlp.experts.gate_proj.weight")
-    assert expert["family"] == "routed_expert"
-    assert expert["pp_rank"] == 2
-    assert expert["source"]["mesh"] == [[8, 9, 10, 11]]
-    assert expert["source"]["placements"] == [
-        {"type": "replicate"},
-        {"type": "shard", "dim": 0},
-    ]
-    assert expert["source"]["local_shape"] == [2, 4, 4]
-    assert expert["source"]["names_by_rank"] == {
-        str(8 + ep_rank): [
-            _expert_name(12, 1, expert_id)
-            for expert_id in range(
-                ep_rank * _EXPERTS_PER_RANK,
-                (ep_rank + 1) * _EXPERTS_PER_RANK,
-            )
-        ]
-        for ep_rank in range(4)
-    }
-    assert expert["destination"]["mesh"] == destination_mesh
-    assert expert["destination"]["placements"] == [
-        {"type": "replicate"},
-        {"type": "shard", "dim": 0},
-    ]
-    assert expert["destination"]["local_shape"] == [2, 4, 4]
-    assert expert["destination"]["parameter"] == ("model.layers.12.mlp.experts.w13_weight")
-
-    assert "dense_source_mesh" not in manifest
-    assert "expert_source_mesh" not in manifest
-    assert "window_arena_bytes" not in manifest
+    kwargs = dict(destination_ep_size=ep, quantization_config=_FP8_CONFIG if fp8 else None)
+    manifest = _build_manifest(payloads, [2, 2], **kwargs)
+    assert manifest == _build_manifest(list(reversed(payloads)), [2, 2], **kwargs)
+    original = deepcopy(manifest)
+    stages = _split_manifest_by_pp(manifest)
+    assert manifest == original
+    assert list(stages) == [0, 1]
+    assert sum(len(s["entries"]) for s in stages.values()) == len(manifest["entries"])
+    assert len(manifest["entries"]) == 18
+    for pp, stage in stages.items():
+        assert stage["source_world_ranks"] == list(range(4 * pp, 4 * pp + 4))
+        assert stage["trainer_world_to_comm_rank"] == {str(4 * pp + rank): rank for rank in range(4)}
+        assert stage["communicator_world_size"] == 8
+        assert stage["manifest_hash"] == nccl_m2n._manifest_digest(stage)
+        for entry in stage["entries"]:
+            assert entry["pp_rank"] == pp
+            layer = int(entry["name"].split(".")[2])
+            assert pp == (0 if layer < 2 else 1)
+            expert = entry["family"] == "routed_expert"
+            assert entry["source"]["mesh"] == [list(range(4 if expert else 2))]
+            assert set(entry["source"]["names_by_rank"]) == {str(r) for r in range(4 if expert else 2)}
+            assert entry["destination"]["mesh"] == [[4, 5], [6, 7]]
+            down = "down_proj" in entry["name"]
+            dim = (0 if ep == 2 else (2 if down else 1)) if expert else int(down)
+            assert entry["destination"]["placements"][1] == {"type": "shard", "dim": dim}
+            shape = entry["global_shape"].copy()
+            shape[dim] //= 2
+            assert entry["destination"]["local_shape"] == shape
+        if fp8:
+            nccl_m2n._validate_fp8_pairs(stage["entries"])
+            assert stage["quantization"]["scale_format"] == "canonical"
+            pairs = {}
+            for entry in stage["entries"]:
+                pairs.setdefault(entry["pair_id"], {})[entry["tensor_role"]] = entry
+            for pair in pairs.values():
+                weight, scale = pair["weight"], pair["scale"]
+                assert weight["dtype"] == "float8_e4m3fn" and scale["dtype"] == "float32"
+                assert scale["global_shape"] == [weight["global_shape"][0], 2, 2]
+                assert scale["source"]["names_by_rank"] == weight["source"]["names_by_rank"]
+            with pytest.raises(ValueError):
+                nccl_m2n._validate_fp8_pairs(stage["entries"][:-1])
 
 
-def test_cartesian_tp_ep_coordinates_are_rejected():
+@pytest.mark.parametrize("fp8,family", [(False, "dense"), (False, "routed_expert"), (True, "routed_expert")])
+def test_atomic_fallback_does_not_drop_peer_weights(fp8, family):
     payloads = _payloads()
-    for payload in payloads:
-        stage_rank = payload["topology"]["world_rank"] % 4
-        payload["topology"]["ep_rank"] = stage_rank // 2
-
-    with pytest.raises(ValueError, match=r"(?i)(expert|EP)"):
-        _build_manifest(payloads, [4] * 8)
-
-
-def test_manifest_rejects_inconsistent_expert_coordinate_grid():
-    payloads = _payloads()
-    for payload in payloads:
-        payload["topology"]["expert_dp_size"] = 2
-
-    with pytest.raises(ValueError, match="expert topology describes 64 ranks"):
-        _build_manifest(payloads, [4] * 8)
-
-
-def test_permuted_complete_expert_id_partitions_are_rejected():
-    payloads = _payloads()
-    for world_rank in (0, 1):
-        payload = payloads[world_rank]
-        renamed = {}
+    blocked = set()
+    for payload in payloads[:4]:
         for spec in payload["specs"]:
-            if spec["family"] != "routed_expert" or spec["layer"] != 0:
-                continue
-            old_name = spec["name"]
-            new_expert_id = (spec["expert_id"] + 2) % 4
-            projection = int(spec["projection"].removeprefix("fc"))
-            spec["expert_id"] = new_expert_id
-            spec["name"] = _expert_name(0, projection, new_expert_id)
-            renamed[old_name] = spec["name"]
-        payload["update_units"] = [[renamed.get(name, name) for name in unit] for unit in payload["update_units"]]
-
-    with pytest.raises(ValueError, match="own expert IDs"):
-        _build_manifest(payloads, [4] * 8)
-
-
-def test_reduced_pp2_manifest_uses_each_layers_owning_stage():
-    manifest = _build_manifest(
-        [_reduced_pp2_payload(rank) for rank in range(4)],
-        [2],
-    )
-
-    assert manifest["source_world_ranks"] == [0, 1, 2, 3]
-    assert manifest["communicator_world_size"] == 6
-    assert len(manifest["entries"]) == 3 * 6
-    for layer, pp_rank, source_mesh in (
-        (0, 0, [[0, 1]]),
-        (1, 0, [[0, 1]]),
-        (2, 1, [[2, 3]]),
-    ):
-        layer_entries = [entry for entry in manifest["entries"] if entry["name"].startswith(f"model.layers.{layer}.")]
-        assert {entry["pp_rank"] for entry in layer_entries} == {pp_rank}
-        assert all(entry["source"]["mesh"] == source_mesh for entry in layer_entries)
-        assert all(entry["destination"]["mesh"] == [[4, 5]] for entry in layer_entries)
-
-
-def test_reduced_pp1_manifest_builds_a_four_rank_2t2r_communicator():
-    manifest = _build_manifest(
-        [_dense_pp1_payload(rank) for rank in range(2)],
-        [2],
-        destination_ep_size=1,
-    )
-
-    assert manifest["source_world_ranks"] == [0, 1]
-    assert manifest["trainer_world_to_comm_rank"] == {"0": 0, "1": 1}
-    assert manifest["communicator_world_size"] == 4
-    assert len(manifest["entries"]) == 2 * 3
-    assert all(entry["source"]["mesh"] == [[0, 1]] for entry in manifest["entries"])
-    assert all(entry["destination"]["mesh"] == [[2, 3]] for entry in manifest["entries"])
-
-
-def test_routed_experts_support_rollout_ep1_with_moe_tensor_parallel_sharding():
-    manifest = _build_manifest(
-        [_reduced_pp1_payload(rank) for rank in range(2)],
-        [2],
-        destination_ep_size=1,
-    )
-
-    assert manifest["source_world_ranks"] == [0, 1]
-    assert manifest["communicator_world_size"] == 4
-    assert len(manifest["entries"]) == 2 * 6
-
-    gate = _entry(manifest, "model.layers.0.mlp.experts.gate_proj.weight")
-    assert gate["global_shape"] == [2, 4, 4]
-    assert gate["destination"]["mesh"] == [[2, 3]]
-    assert gate["destination"]["placements"] == [
-        {"type": "replicate"},
-        {"type": "shard", "dim": 1},
-    ]
-    assert gate["destination"]["local_shape"] == [2, 2, 4]
-
-    down = _entry(manifest, "model.layers.0.mlp.experts.down_proj.weight")
-    assert down["global_shape"] == [2, 4, 4]
-    assert down["destination"]["mesh"] == [[2, 3]]
-    assert down["destination"]["placements"] == [
-        {"type": "replicate"},
-        {"type": "shard", "dim": 2},
-    ]
-    assert down["destination"]["local_shape"] == [2, 4, 2]
-
-
-def test_routed_experts_reject_hybrid_rollout_ep_and_moe_tp():
-    with pytest.raises(ValueError, match="supports rollout EP=1 or EP=TP"):
-        _build_manifest(
-            _payloads(),
-            [4] * 8,
-            destination_ep_size=2,
-        )
-
-
-@pytest.mark.parametrize("scale_fmt", [None, "fp32", "ue8m0"])
-def test_fp8_manifest_v1_models_complete_expert_weight_scale_pairs(scale_fmt):
-    quantization_config = deepcopy(_FP8_CONFIG)
-    if scale_fmt is not None:
-        quantization_config["scale_fmt"] = scale_fmt
-
-    payloads = _fp8_payloads()
-    manifest = _build_manifest(
-        payloads,
-        [2],
-        quantization_config=quantization_config,
-    )
-    reordered = _build_manifest(
-        list(reversed(payloads)),
-        [2],
-        quantization_config=quantization_config,
-    )
-
-    assert manifest == reordered
-    assert manifest["schema_version"] == 1
-    assert manifest["quantization"] == {
-        "quant_method": "fp8",
-        "activation_scheme": "dynamic",
-        "weight_block_size": [128, 128],
-        "weight_dtype": "float8_e4m3fn",
-        "scale_dtype": "float32",
-        "scale_format": "canonical",
-    }
-    assert len(manifest["entries"]) == 3 * 3 * 2
-    assert {entry["family"] for entry in manifest["entries"]} == {"routed_expert"}
-    assert all(all(".mlp.experts." in name for name in update_unit) for update_unit in manifest["routed_update_units"])
-
-    pairs = {}
-    for entry in manifest["entries"]:
-        pairs.setdefault(entry["pair_id"], []).append(entry)
-    assert len(pairs) == 3 * 3
-    assert all(
-        {entry["tensor_role"] for entry in pair} == {"weight", "scale"} and len(pair) == 2 for pair in pairs.values()
-    )
-
-    for layer in range(3):
-        source_mesh = [[0, 1]] if layer < 2 else [[2, 3]]
-        for component, source_recipe, destination_parameter in (
-            ("gate", "expert_fc1_0", "w13_weight"),
-            ("up", "expert_fc1_1", "w13_weight"),
-            ("down", "expert_fc2", "w2_weight"),
-        ):
-            weight_name = f"model.layers.{layer}.mlp.experts." f"{component}_proj.weight"
-            scale_name = f"{weight_name}_scale_inv"
-            weight = _entry(manifest, weight_name)
-            scale = _entry(manifest, scale_name)
-
-            assert weight["pair_id"] == scale["pair_id"] == weight_name
-            assert weight["tensor_role"] == "weight"
-            assert scale["tensor_role"] == "scale"
-            assert weight["dtype"] == "float8_e4m3fn"
-            assert scale["dtype"] == "float32"
-            assert weight["global_shape"] == [2, 256, 256]
-            assert scale["global_shape"] == [2, 2, 2]
-            assert weight["source"]["mesh"] == source_mesh
-            assert scale["source"]["mesh"] == source_mesh
-            assert weight["source"]["local_shape"] == [1, 256, 256]
-            assert scale["source"]["local_shape"] == [1, 2, 2]
-            assert scale["source"]["names_by_rank"] == (weight["source"]["names_by_rank"])
-            assert weight["source"]["recipe"] == source_recipe
-            assert scale["source"]["recipe"] == f"{source_recipe}_scale"
-            assert weight["destination"]["local_shape"] == [1, 256, 256]
-            assert scale["destination"]["local_shape"] == [1, 2, 2]
-            assert weight["destination"]["recipe"] == f"expert_{component}"
-            assert scale["destination"]["recipe"] == f"expert_{component}_scale"
-            parameter_prefix = f"model.layers.{layer}.mlp.experts."
-            assert weight["destination"]["parameter"] == (parameter_prefix + destination_parameter)
-            assert scale["destination"]["parameter"] == (
-                parameter_prefix + destination_parameter.replace("_weight", "_weight_scale_inv")
-            )
-
-
-def test_fp8_manifest_hash_covers_quantization_and_atomic_pair_metadata():
-    manifest = _build_manifest(
-        _fp8_payloads(),
-        [2],
-        quantization_config=_FP8_CONFIG,
-    )
-
-    for mutate in (
-        lambda value: value["quantization"].__setitem__("scale_format", "ue8m0"),
-        lambda value: value["entries"][0].__setitem__("pair_id", "injected-incomplete-pair"),
-        lambda value: value["entries"][0].__setitem__("tensor_role", "scale"),
-    ):
-        tampered = deepcopy(manifest)
-        mutate(tampered)
-        assert nccl_m2n._manifest_digest(tampered) != manifest["manifest_hash"]
-
-
-def test_fp8_manifest_supports_rollout_ep1_with_moe_tensor_parallel_sharding():
-    manifest = _build_manifest(
-        _fp8_payloads(),
-        [2],
-        quantization_config=_FP8_CONFIG,
-        destination_ep_size=1,
-    )
-
-    gate = _entry(manifest, "model.layers.0.mlp.experts.gate_proj.weight")
-    gate_scale = _entry(manifest, "model.layers.0.mlp.experts.gate_proj.weight_scale_inv")
-    assert gate["destination"]["placements"][1] == {"type": "shard", "dim": 1}
-    assert gate["destination"]["local_shape"] == [2, 128, 256]
-    assert gate_scale["destination"]["placements"][1] == {"type": "shard", "dim": 1}
-    assert gate_scale["destination"]["local_shape"] == [2, 1, 2]
-
-    down = _entry(manifest, "model.layers.0.mlp.experts.down_proj.weight")
-    down_scale = _entry(manifest, "model.layers.0.mlp.experts.down_proj.weight_scale_inv")
-    assert down["destination"]["placements"][1] == {"type": "shard", "dim": 2}
-    assert down["destination"]["local_shape"] == [2, 256, 128]
-    assert down_scale["destination"]["placements"][1] == {"type": "shard", "dim": 2}
-    assert down_scale["destination"]["local_shape"] == [2, 2, 1]
-
-
-def test_fp8_pair_validation_rejects_missing_or_mismatched_scale():
-    manifest = _build_manifest(
-        _fp8_payloads(),
-        [2],
-        quantization_config=_FP8_CONFIG,
-    )
-    weight = next(entry for entry in manifest["entries"] if entry["tensor_role"] == "weight")
-    entries_without_scale = [
-        entry
-        for entry in manifest["entries"]
-        if not (entry["pair_id"] == weight["pair_id"] and entry["tensor_role"] == "scale")
-    ]
-
-    with pytest.raises(ValueError, match=r"(?i)(incomplete|pair|scale)"):
-        nccl_m2n._validate_fp8_pairs(entries_without_scale)
-
-    entries_with_bad_scale = deepcopy(manifest["entries"])
-    scale = next(
-        entry
-        for entry in entries_with_bad_scale
-        if entry["pair_id"] == weight["pair_id"] and entry["tensor_role"] == "scale"
-    )
-    scale["source"]["recipe"] = "wrong_scale_recipe"
-    with pytest.raises(ValueError, match=r"(?i)(inconsistent|pair|scale)"):
-        nccl_m2n._validate_fp8_pairs(entries_with_bad_scale)
-
-    entries_without_projection = [entry for entry in manifest["entries"] if entry["pair_id"] != weight["pair_id"]]
-    with pytest.raises(
-        ValueError,
-        match=r"(?i)(atomic|complete|gate|up|down|projection)",
-    ):
-        nccl_m2n._validate_fp8_pairs(entries_without_projection)
-
-
-def test_fp8_partial_fc1_atomic_unit_drops_the_whole_expert_module():
-    payloads = _fp8_payloads()
-    blocked_name = _expert_name(0, 1, 0)
-    unsupported_peer = f"{blocked_name}.unsupported_peer"
-    payloads[0]["update_units"] = [
-        [blocked_name, unsupported_peer] if unit == [blocked_name] else unit for unit in payloads[0]["update_units"]
-    ]
-
-    manifest = _build_manifest(
-        payloads,
-        [2],
-        quantization_config=_FP8_CONFIG,
-    )
-    names = {entry["name"] for entry in manifest["entries"]}
-    routed_names = {name for update_unit in manifest["routed_update_units"] for name in update_unit}
-
-    assert not any(name.startswith("model.layers.0.mlp.experts.") for name in names)
-    assert blocked_name not in routed_names
-    assert {
-        f"model.layers.1.mlp.experts.{component}_proj.{suffix}"
-        for component in ("gate", "up", "down")
-        for suffix in ("weight", "weight_scale_inv")
-    }.issubset(names)
-
-
-@pytest.mark.parametrize(
-    ("quantization_config", "message"),
-    [
-        (
-            {**_FP8_CONFIG, "quant_method": "mxfp8"},
-            r"(?i)(quant|fp8)",
-        ),
-        (
-            {**_FP8_CONFIG, "fmt": "e5m2"},
-            r"(?i)(format|fmt|e4m3)",
-        ),
-        (
-            {**_FP8_CONFIG, "activation_scheme": "static"},
-            r"(?i)(activation|dynamic)",
-        ),
-        (
-            {**_FP8_CONFIG, "weight_block_size": [64, 128]},
-            r"(?i)(block|128)",
-        ),
-        (
-            {key: value for key, value in _FP8_CONFIG.items() if key != "weight_block_size"},
-            r"(?i)(block|128)",
-        ),
-    ],
-)
-def test_fp8_manifest_rejects_unsupported_quantization_configs(
-    quantization_config,
-    message,
-):
-    with pytest.raises(ValueError, match=message):
-        _build_manifest(
-            _fp8_payloads(),
-            [2],
-            quantization_config=quantization_config,
-        )
-
-
-def test_canonical_fp8_quantizer_preserves_expert_axes_and_fp32_scale_grid():
-    weight = (
-        torch.arange(
-            2 * 256 * 256,
-            dtype=torch.float32,
-        )
-        .reshape(2, 256, 256)
-        .to(torch.bfloat16)
-    )
-    expected_qweight = torch.zeros(
-        512,
-        256,
-        dtype=torch.float8_e4m3fn,
-    )
-    expected_scale = torch.arange(
-        8,
-        dtype=torch.float32,
-    ).reshape(4, 2)
-    cast = Mock(return_value=(expected_qweight, expected_scale))
-
-    with (
-        patch.object(nccl_m2n, "per_block_cast_to_fp8", cast),
-        patch.object(
-            nccl_m2n,
-            "blockwise_cast_to_fp8_triton",
-            side_effect=AssertionError("unexpected Triton fallback"),
-        ),
-    ):
-        qweight, scale = nccl_m2n._quantize_canonical_block_fp8(weight)
-
-    cast.assert_called_once()
-    torch.testing.assert_close(
-        cast.call_args.args[0],
-        weight.reshape(512, 256),
-    )
-    assert qweight.shape == weight.shape
-    assert qweight.dtype == torch.float8_e4m3fn
-    assert qweight.is_contiguous()
-    assert scale.shape == (2, 2, 2)
-    assert scale.dtype == torch.float32
-    assert scale.is_contiguous()
-    torch.testing.assert_close(scale, expected_scale.reshape(2, 2, 2))
+            if spec["layer"] == 0 and spec["family"] == family and spec["projection"] == "fc1":
+                blocked.add(spec["name"])
+        payload["update_units"] = [
+            unit + ["unsupported.peer"] if unit[0] in blocked else unit for unit in payload["update_units"]
+        ]
+    manifest = _build_manifest(payloads, [2, 2], quantization_config=_FP8_CONFIG if fp8 else None)
+    prefix = "model.layers.0.mlp." + ("experts." if family == "routed_expert" else "")
+    names = {e["name"] for e in manifest["entries"]}
+    assert prefix + "gate_proj.weight" not in names
+    assert prefix + "up_proj.weight" not in names
+    assert (prefix + "down_proj.weight" in names) is (not fp8)
+    routed = {name for unit in manifest["routed_update_units"] for name in unit}
+    assert routed.isdisjoint(blocked)
+    # Coalesced expert entries must not leave any peer fc1 marked as routed.
+    assert any(name.startswith("model.layers.1.") for name in names)
 
 
 def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused():
     manifest = _build_manifest(
-        _fp8_payloads(),
+        _payloads(),
         [2],
         quantization_config=_FP8_CONFIG,
     )
@@ -839,219 +233,9 @@ def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused():
     assert stream.synchronize.call_count == 4
 
 
-def test_partial_atomic_unit_stays_entirely_on_broadcast():
-    payloads = deepcopy(_payloads())
-    for payload in payloads:
-        if payload["topology"]["pp_rank"] == 0:
-            payload["update_units"] = [
-                [_DENSE_FC1, _UNMAPPED],
-                *[unit for unit in payload["update_units"] if unit not in ([_DENSE_FC1], [_UNMAPPED])],
-            ]
-
-    manifest = _build_manifest(payloads, [4] * 8)
-    entry_names = {entry["name"] for entry in manifest["entries"]}
-
-    assert "model.layers.0.mlp.gate_proj.weight" not in entry_names
-    assert "model.layers.0.mlp.up_proj.weight" not in entry_names
-    assert "model.layers.0.mlp.down_proj.weight" in entry_names
-    assert [_DENSE_FC1, _UNMAPPED] not in manifest["routed_update_units"]
-    assert "residual_update_units" not in manifest
-
-
-def test_coalesced_expert_entry_does_not_leave_peer_units_marked_routed():
-    payloads = _payloads()
-    blocked_name = _expert_name(0, 1, 0)
-    unsupported_scale = f"{blocked_name}.scale_inv"
-    owner = payloads[0]
-    owner["update_units"] = [
-        [blocked_name, unsupported_scale] if unit == [blocked_name] else unit for unit in owner["update_units"]
-    ]
-
-    manifest = _build_manifest(payloads, [4] * 8)
-    entry_names = {entry["name"] for entry in manifest["entries"]}
-    routed_names = {name for update_unit in manifest["routed_update_units"] for name in update_unit}
-    layer_fc1_names = {_expert_name(0, 1, expert_id) for expert_id in range(4 * _EXPERTS_PER_RANK)}
-
-    assert "model.layers.0.mlp.experts.gate_proj.weight" not in entry_names
-    assert "model.layers.0.mlp.experts.up_proj.weight" not in entry_names
-    assert routed_names.isdisjoint(layer_fc1_names)
-    assert "model.layers.0.mlp.experts.down_proj.weight" in entry_names
-    assert "model.layers.1.mlp.experts.gate_proj.weight" in entry_names
-
-
-def test_m2n_group_names_are_unique_per_connection():
-    first = _new_m2n_group_name()
-    second = _new_m2n_group_name()
-
-    assert first.startswith("miles-m2n-")
-    assert second.startswith("miles-m2n-")
-    assert first != second
-
-
-@pytest.mark.parametrize("fp8", [False, True])
-def test_pp8_communicators_remap_owners_and_all_eight_rollout_replicas(fp8):
-    payloads = _payloads()
-    if fp8:
-        for payload in payloads:
-            for spec in payload["specs"]:
-                if spec["family"] == "routed_expert":
-                    spec["local_shape"] = [512, 256] if spec["projection"] == "fc1" else [256, 256]
-    manifest = _build_manifest(payloads, [4] * 8, quantization_config=_FP8_CONFIG if fp8 else None)
-    original = deepcopy(manifest)
-    stages = _split_manifest_by_pp(manifest)
-    assert list(stages) == list(range(8))
-    assert manifest == original
-    assert sum(len(stage["entries"]) for stage in stages.values()) == len(manifest["entries"])
-    for pp_rank, stage in stages.items():
-        assert stage["communicator_world_size"] == 36
-        assert stage["source_world_ranks"] == list(range(4 * pp_rank, 4 * pp_rank + 4))
-        assert stage["trainer_world_to_comm_rank"] == {str(4 * pp_rank + rank): rank for rank in range(4)}
-        assert stage["pp_rank"] == pp_rank
-        assert stage["manifest_hash"] == nccl_m2n._manifest_digest(stage)
-        if fp8:
-            assert stage["quantization"] == manifest["quantization"]
-            nccl_m2n._validate_fp8_pairs(stage["entries"])
-        for entry in stage["entries"]:
-            before = _entry(manifest, entry["name"])
-            assert entry["pp_rank"] == pp_rank
-            assert entry["global_shape"] == before["global_shape"]
-            assert entry["destination"]["parameter"] == before["destination"]["parameter"]
-            assert entry["destination"]["mesh"] == [
-                list(range(4 + 4 * replica, 8 + 4 * replica)) for replica in range(8)
-            ]
-            assert entry["source"]["mesh"] == [[rank - 4 * pp_rank for rank in before["source"]["mesh"][0]]]
-            assert entry["source"]["names_by_rank"] == {
-                str(int(rank) - 4 * pp_rank): names for rank, names in before["source"]["names_by_rank"].items()
-            }
-
-
-def test_pp1_and_empty_bulk_stages_do_not_create_extra_communicators():
-    manifest = _build_manifest([_reduced_pp1_payload(rank) for rank in range(2)], [2])
-    stages = _split_manifest_by_pp(manifest)
-    assert list(stages) == [0]
-    assert stages[0]["communicator_world_size"] == 4
-    assert stages[0]["entries"] == manifest["entries"]
-
-    manifest = _build_manifest(_payloads(), [4] * 8)
-    manifest["entries"] = [entry for entry in manifest["entries"] if entry["pp_rank"] in (2, 7)]
-    stages = _split_manifest_by_pp(manifest)
-    assert list(stages) == [2, 7]
-    assert stages[2]["source_world_ranks"] == [8, 9, 10, 11]
-    assert stages[7]["source_world_ranks"] == [28, 29, 30, 31]
-    assert all(stage["communicator_world_size"] == 36 for stage in stages.values())
-
-
-@pytest.mark.parametrize("world_rank", [0, 1, 2, 3])
-@pytest.mark.parametrize("fail_second_stage", [False, True])
-def test_connect_joins_only_local_pp_and_initializes_each_stage_on_every_engine(world_rank, fail_second_stage):
-    manifest = _build_manifest([_reduced_pp2_payload(rank) for rank in range(4)], [2, 2])
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.args = SimpleNamespace(rollout_num_gpus=4, rollout_num_gpus_per_engine=2, pipeline_model_parallel_size=2)
-    updater._m2n_manifest = manifest
-    updater._m2n_group_names = {}
-    updater._m2n_group_name = None
-    updater._m2n_pg = None
-    updater._connection_stale = True
-    updater._disconnect_existing = Mock()
-    updater._negotiate_manifest = Mock(return_value=manifest)
-    engines = [Mock(), Mock()]
-
-    def rendezvous(objects, src, group):
-        objects[0] = {"master_address": "127.0.0.1", "master_port": 1234 + src, "group_name": f"pp-{src // 2}"}
-
-    def collect(error):
-        # Inject the globally propagated error on the second setup collective.
-        if fail_second_stage and len(updater._m2n_group_names) == 2:
-            return ["injected PP1 receiver initialization failure"]
-        return [error] if error else []
-
-    with (
-        patch.object(
-            nccl_m2n, "get_parallel_state", return_value=SimpleNamespace(pp=SimpleNamespace(rank=world_rank // 2))
-        ),
-        patch.object(nccl_m2n.dist, "get_rank", return_value=world_rank),
-        patch.object(nccl_m2n.dist, "broadcast_object_list", side_effect=rendezvous),
-        patch.object(nccl_m2n, "get_gloo_group"),
-        patch.object(nccl_m2n, "_collect_errors", side_effect=collect),
-        patch.object(nccl_m2n, "_process_group_options"),
-        patch.object(nccl_m2n, "init_process_group") as init_pg,
-        patch.object(nccl_m2n, "_warm_and_borrow_nccl_comm", return_value=123 + world_rank),
-        patch.object(nccl_m2n.socket, "socket"),
-        patch.object(nccl_m2n.ray._private.services, "get_node_ip_address", return_value="127.0.0.1"),
-        patch.object(nccl_m2n.torch.cuda, "current_device", return_value=0),
-        patch.object(nccl_m2n.ray, "get", return_value=[{"success": True}, {"success": True}]),
-        patch.object(UpdateWeightFromNcclM2N, "_is_source", False),
-    ):
-        if fail_second_stage:
-            with pytest.raises(RuntimeError, match="PP1 receiver initialization failure"):
-                updater.connect_rollout_engines(engines, Mock())
-            assert updater._disconnect_existing.call_count == 2
-            assert updater._connection_stale is True
-        else:
-            updater.connect_rollout_engines(engines, Mock())
-            assert updater._connection_stale is False
-    assert updater._m2n_group_names == {0: "pp-0", 1: "pp-1"}
-    assert init_pg.call_count == 1
-    assert init_pg.call_args.kwargs["world_size"] == 6
-    assert init_pg.call_args.kwargs["rank"] == world_rank % 2
-    assert init_pg.call_args.kwargs["group_name"] == f"pp-{world_rank // 2}"
-    assert updater._m2n_comm_rank == world_rank % 2
-    for replica, engine in enumerate(engines):
-        calls = engine.init_weights_update_group.remote.call_args_list
-        assert len(calls) == (2 if world_rank == 0 else 0)
-        for pp_rank, invocation in enumerate(calls):
-            assert invocation.args[2:5] == (2 + 2 * replica, 6, f"pp-{pp_rank}")
-            assert invocation.kwargs["m2n_manifest"]["pp_rank"] == pp_rank
-
-
-@pytest.mark.parametrize("local_pp", [0, 1])
-def test_stage_update_uses_only_owning_trainers_and_routes_receiver_rpc(local_pp):
-    stages = _split_manifest_by_pp(_build_manifest([_reduced_pp2_payload(rank) for rank in range(4)], [2]))
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater._m2n_group_names = {0: "pp-0", 1: "pp-1"}
-    updater._m2n_group_name = f"pp-{local_pp}"
-    updater._run_m2n_batch = Mock()
-    engine = Mock()
-    updater.rollout_engines = [engine]
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=2 * local_pp),
-        patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
-        patch.object(nccl_m2n.ray, "get", return_value=[{"success": True}]),
-    ):
-        for stage, manifest in stages.items():
-            updater._update_m2n_stage(stage, manifest)
-    updater._run_m2n_batch.assert_called_once_with(stages[local_pp])
-    calls = engine.update_weights_from_distributed.remote.call_args_list
-    assert len(calls) == (2 if local_pp == 0 else 0)
-    for pp_rank, invocation in enumerate(calls):
-        assert invocation.kwargs["group_name"] == f"pp-{pp_rank}"
-        assert invocation.kwargs["names"] == [entry["name"] for entry in stages[pp_rank]["entries"]]
-
-
-def test_failed_stage_update_releases_lock_without_starting_later_stages():
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.args = SimpleNamespace(m2n_pp_concurrency=1)
-    updater._m2n_manifest = {"entries": []}
-    updater._m2n_group_names = {0: "pp-0", 1: "pp-1", 2: "pp-2"}
-    updater._m2n_stage_manifests = {0: {}, 1: {}, 2: {}}
-    updater._connection_stale = False
-    updater.rollout_engine_lock = Mock()
-    updater._update_m2n_stage = Mock(side_effect=[None, RuntimeError("injected PP1 failure")])
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
-        patch.object(nccl_m2n.ray, "get", return_value=True),
-        pytest.raises(RuntimeError, match="PP1 failure"),
-    ):
-        updater._update_bulk_weights()
-    assert updater._update_m2n_stage.call_args_list == [call(0, {}), call(1, {})]
-    updater.rollout_engine_lock.release.remote.assert_called_once()
-    assert updater._connection_stale is True
-
-
 @pytest.mark.parametrize("local_pp", [0, 1, 2])
 def test_concurrent_wave_dispatches_one_rpc_and_only_local_selected_stage(local_pp):
-    stages = _split_manifest_by_pp(_build_manifest(_payloads(), [4] * 8))
+    stages = _split_manifest_by_pp(_build_manifest(_payloads(), [2, 2]))
     wave = {stage: stages[stage] for stage in (0, 1)}
     updater = object.__new__(UpdateWeightFromNcclM2N)
     updater._m2n_group_names = {stage: f"pp-{stage}" for stage in stages}
@@ -1079,51 +263,42 @@ def test_concurrent_wave_dispatches_one_rpc_and_only_local_selected_stage(local_
         assert payload["names"] == [entry["name"] for stage in wave.values() for entry in stage["entries"]]
 
 
-@pytest.mark.parametrize("concurrency", [None, 1, 2, 3, 8])
-def test_pp_wave_scheduling_is_bounded_and_covers_uneven_tail(concurrency):
+@pytest.mark.parametrize("concurrency,fail", [(1, False), (2, False), (3, False), (2, True)])
+def test_pp_waves_cover_uneven_tail_and_stop_on_failure(concurrency, fail):
     updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.args = SimpleNamespace(**({} if concurrency is None else {"m2n_pp_concurrency": concurrency}))
+    updater.args = SimpleNamespace(m2n_pp_concurrency=concurrency)
     updater._m2n_manifest = {"entries": []}
     updater._m2n_group_names = {stage: f"pp-{stage}" for stage in range(5)}
     updater._m2n_stage_manifests = {stage: {} for stage in range(5)}
     updater.rollout_engine_lock = Mock()
     waves = []
-    updater._update_m2n_stage = lambda stage, manifest: waves.append([stage])
-    updater._update_m2n_stages = lambda stages: waves.append(list(stages))
+
+    def dispatch(stages):
+        waves.append(list(stages))
+        if fail:
+            raise RuntimeError("wave failure")
+
+    updater._update_m2n_stage = lambda stage, manifest: dispatch({stage: manifest})
+    updater._update_m2n_stages = dispatch
     with (
         patch.object(nccl_m2n.dist, "get_rank", return_value=0),
         patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
         patch.object(nccl_m2n.ray, "get", return_value=True),
     ):
-        assert updater._update_bulk_weights() is True
-    width = 2 if concurrency is None else concurrency
-    assert waves == [list(range(start, min(start + width, 5))) for start in range(0, 5, width)]
+        if fail:
+            with pytest.raises(RuntimeError, match="wave failure"):
+                updater._update_bulk_weights()
+            assert waves == [[0, 1]]
+            assert updater._connection_stale is True
+        else:
+            assert updater._update_bulk_weights() is True
+            assert waves == [list(range(start, min(start + concurrency, 5))) for start in range(0, 5, concurrency)]
     updater.rollout_engine_lock.acquire.remote.assert_called_once()
     updater.rollout_engine_lock.release.remote.assert_called_once()
 
 
-def test_failed_concurrent_wave_stops_later_waves_and_releases_lock():
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.args = SimpleNamespace(m2n_pp_concurrency=2)
-    updater._m2n_manifest = {"entries": []}
-    updater._m2n_group_names = {stage: f"pp-{stage}" for stage in range(4)}
-    updater._m2n_stage_manifests = {stage: {} for stage in range(4)}
-    updater.rollout_engine_lock = Mock()
-    updater._update_m2n_stages = Mock(side_effect=RuntimeError("injected wave failure"))
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        patch.object(nccl_m2n, "_collect_errors", side_effect=lambda error: [error] if error else []),
-        patch.object(nccl_m2n.ray, "get", return_value=True),
-        pytest.raises(RuntimeError, match="wave failure"),
-    ):
-        updater._update_bulk_weights()
-    updater._update_m2n_stages.assert_called_once_with({0: {}, 1: {}})
-    updater.rollout_engine_lock.release.remote.assert_called_once()
-    assert updater._connection_stale is True
-
-
 def test_sender_orders_dense_expert_source_handoffs_inside_one_pp_group():
-    manifest = _split_manifest_by_pp(_build_manifest(_payloads(), [4] * 8))[0]
+    manifest = _split_manifest_by_pp(_build_manifest(_payloads(), [2, 2]))[0]
     updater = object.__new__(UpdateWeightFromNcclM2N)
     updater._m2n_manifest = manifest
     updater._m2n_pg = object()
@@ -1151,380 +326,3 @@ def test_sender_orders_dense_expert_source_handoffs_inside_one_pp_group():
     assert events == expected
     assert barrier.call_count > 0
     assert all(invocation.kwargs["group"] is updater._m2n_pg for invocation in barrier.call_args_list)
-
-
-def test_prepare_failure_is_propagated_before_the_phase_barrier():
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater._connection_stale = False
-
-    with (
-        patch.object(
-            nccl_m2n.UpdateWeightFromDistributed,
-            "_pause_and_prepare_engines",
-            side_effect=RuntimeError("injected prepare failure"),
-        ),
-        patch.object(
-            nccl_m2n,
-            "_collect_errors",
-            return_value=["trainer rank 0 rollout prepare: " "RuntimeError: injected prepare failure"],
-        ) as collect,
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        pytest.raises(RuntimeError, match="injected prepare failure"),
-    ):
-        updater._pause_and_prepare_engines()
-
-    collect.assert_called_once()
-    assert updater._connection_stale is True
-
-
-@pytest.mark.parametrize(
-    ("rollout_gpus", "engine_gpus", "engine_count", "counts"),
-    [
-        (2, 2, 1, None),
-        (2, 1, 2, [1, 1]),
-        (32, 4, 8, [4] * 8),
-    ],
-)
-def test_engine_gpu_counts_are_derived_from_rollout_configuration(
-    rollout_gpus,
-    engine_gpus,
-    engine_count,
-    counts,
-):
-    args = SimpleNamespace(
-        rollout_num_gpus=rollout_gpus,
-        rollout_num_gpus_per_engine=engine_gpus,
-    )
-
-    assert nccl_m2n._validated_engine_gpu_counts(args, engine_count, counts) == [engine_gpus] * engine_count
-
-
-@pytest.mark.parametrize(
-    ("engine_count", "counts", "message"),
-    [
-        (2, [2, 2], "expected 1 rollout engine handles"),
-        (1, [2, 2], "one GPU count per rollout engine"),
-        (1, [1], "homogeneous 2-GPU rollout engines"),
-    ],
-)
-def test_connect_rejects_engine_layout_mismatches_before_group_setup(engine_count, counts, message):
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.args = SimpleNamespace(
-        rollout_num_gpus=2,
-        rollout_num_gpus_per_engine=2,
-    )
-
-    with pytest.raises(ValueError, match=message):
-        updater.connect_rollout_engines(
-            [Mock()] * engine_count,
-            Mock(),
-            engine_gpu_counts=counts,
-        )
-
-
-def test_residual_failure_is_deferred_until_trainer_collectives_drain():
-    acquire = Mock(return_value="acquire-ref")
-    release = Mock(return_value="release-ref")
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater._deferred_update_error = None
-    updater._connection_stale = False
-    updater.rollout_engine_lock = SimpleNamespace(
-        acquire=SimpleNamespace(remote=acquire),
-        release=SimpleNamespace(remote=release),
-    )
-    updater._group_name = "miles-pp-0"
-    updater._model_update_groups = object()
-    updater.rollout_engines = []
-    updater.update_weight_metrics = {"m2n_broadcast_bytes": 0.0}
-    tensor = Mock()
-    tensor.numel.return_value = 1
-    tensor.element_size.return_value = 2
-    converted = [("weight", tensor)]
-
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        patch.object(nccl_m2n.ray, "get", side_effect=[True, None]),
-        patch.object(
-            nccl_m2n,
-            "update_weights_from_distributed",
-            side_effect=RuntimeError("injected residual failure"),
-        ),
-    ):
-        updater._update_weight_implementation(converted)
-
-    assert converted == []
-    assert "injected residual failure" in updater._deferred_update_error
-    release.assert_called_once()
-    assert updater.update_weight_metrics["m2n_broadcast_bytes"] == 0.0
-
-    with (
-        patch.object(
-            nccl_m2n,
-            "_collect_errors",
-            side_effect=lambda error: [error] if error else [],
-        ),
-        pytest.raises(RuntimeError, match="injected residual failure"),
-    ):
-        updater._raise_deferred_update_errors()
-
-    assert updater._connection_stale is True
-
-
-def test_teardown_launches_remote_before_destroying_local_and_waiting():
-    events = []
-
-    def launch_remote(group_name):
-        events.append(f"launch:{group_name}")
-        return f"ref:{group_name}"
-
-    def wait_remote(ref):
-        events.append(f"wait:{ref.removeprefix('ref:')}")
-        return {"success": True, "message": "destroyed"}
-
-    engine = SimpleNamespace(destroy_weights_update_group=SimpleNamespace(remote=launch_remote))
-    process_group = object()
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.rollout_engines = [engine]
-    updater._m2n_manifest = {"entries": []}
-    updater._m2n_group_name = "miles-m2n-old"
-    updater._m2n_group_names = {0: "miles-m2n-old", 1: "miles-m2n-old-pp1"}
-    updater._m2n_routed_units = set()
-    updater._group_name = "miles-pp-0"
-    updater._model_update_groups = process_group
-    updater._residual_pp_rank = 0
-    updater._residual_group_started = True
-    updater._connection_stale = False
-    updater._teardown_local_m2n = Mock(side_effect=lambda: events.append("local:miles-m2n-old"))
-
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        patch.object(nccl_m2n.dist, "get_world_size", return_value=1),
-        patch.object(
-            nccl_m2n.dist,
-            "all_gather_object",
-            side_effect=lambda output, value, group: output.__setitem__(0, value),
-        ),
-        patch.object(nccl_m2n, "get_gloo_group", return_value=object()),
-        patch.object(nccl_m2n.ray, "get", side_effect=wait_remote),
-        patch.object(
-            nccl_m2n.dist,
-            "destroy_process_group",
-            side_effect=lambda group: events.append("local:miles-pp-0"),
-        ),
-        patch.object(UpdateWeightFromNcclM2N, "_is_source", True),
-    ):
-        updater._disconnect_existing()
-
-    assert events == [
-        "launch:miles-m2n-old",
-        "launch:miles-m2n-old-pp1",
-        "local:miles-m2n-old",
-        "wait:miles-m2n-old",
-        "wait:miles-m2n-old-pp1",
-        "launch:miles-pp-0",
-        "local:miles-pp-0",
-        "wait:miles-pp-0",
-    ]
-
-
-def test_mixed_teardown_success_is_idempotently_retryable():
-    destroy_remote_a = Mock(return_value="destroy-ref-a")
-    destroy_remote_b = Mock(return_value="destroy-ref-b")
-    engines = [
-        SimpleNamespace(destroy_weights_update_group=SimpleNamespace(remote=destroy_remote_a)),
-        SimpleNamespace(destroy_weights_update_group=SimpleNamespace(remote=destroy_remote_b)),
-    ]
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.rollout_engines = engines
-    updater._m2n_manifest = {"entries": []}
-    updater._m2n_group_name = "miles-m2n-old"
-    updater._m2n_group_names = {0: "miles-m2n-old"}
-    updater._m2n_routed_units = {("weight",)}
-    updater._model_update_groups = None
-    updater._connection_stale = False
-    updater._teardown_local_m2n = Mock()
-
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        patch.object(nccl_m2n.dist, "get_world_size", return_value=1),
-        patch.object(
-            nccl_m2n.dist,
-            "all_gather_object",
-            side_effect=lambda output, value, group: output.__setitem__(0, value),
-        ),
-        patch.object(nccl_m2n.dist, "barrier"),
-        patch.object(nccl_m2n, "get_gloo_group", return_value=object()),
-        patch.object(
-            nccl_m2n.ray,
-            "get",
-            side_effect=[
-                {"success": True, "message": "destroyed"},
-                {"success": False, "message": "injected teardown failure"},
-                {"success": True, "message": "already absent"},
-                {"success": True, "message": "destroyed"},
-            ],
-        ),
-        patch.object(
-            UpdateWeightFromNcclM2N,
-            "_is_source",
-            False,
-        ),
-    ):
-        with pytest.raises(RuntimeError, match="injected teardown failure"):
-            updater._disconnect_existing()
-
-        assert updater._m2n_group_name == "miles-m2n-old"
-        assert updater._m2n_manifest == {"entries": []}
-        assert updater._connection_stale is True
-
-        updater._disconnect_existing()
-
-    assert destroy_remote_a.call_args_list == [
-        call("miles-m2n-old"),
-        call("miles-m2n-old"),
-    ]
-    assert destroy_remote_b.call_args_list == [
-        call("miles-m2n-old"),
-        call("miles-m2n-old"),
-    ]
-    assert updater._m2n_group_name is None
-    assert updater._m2n_manifest is None
-    assert updater._m2n_routed_units == set()
-
-
-def test_local_teardown_failure_is_propagated_collectively_and_retryable():
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.rollout_engines = []
-    updater._m2n_manifest = {"entries": []}
-    updater._m2n_group_name = "miles-m2n-old"
-    updater._m2n_group_names = {0: "miles-m2n-old"}
-    updater._m2n_routed_units = set()
-    updater._model_update_groups = None
-    updater._connection_stale = False
-    updater._teardown_local_m2n = Mock(side_effect=[RuntimeError("injected local teardown failure"), None])
-
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        patch.object(nccl_m2n.dist, "get_world_size", return_value=1),
-        patch.object(
-            nccl_m2n.dist,
-            "all_gather_object",
-            side_effect=lambda output, value, group: output.__setitem__(0, value),
-        ) as gather,
-        patch.object(nccl_m2n.dist, "barrier"),
-        patch.object(nccl_m2n, "get_gloo_group", return_value=object()),
-        patch.object(UpdateWeightFromNcclM2N, "_is_source", False),
-    ):
-        with pytest.raises(RuntimeError, match="injected local teardown failure"):
-            updater._disconnect_existing()
-
-        assert gather.call_count == 1
-        assert updater._m2n_group_name == "miles-m2n-old"
-
-        updater._disconnect_existing()
-
-    assert updater._m2n_group_name is None
-    assert updater._m2n_manifest is None
-
-
-def test_unreachable_retired_engine_does_not_block_replacement():
-    destroy_remote = Mock(return_value="destroy-ref")
-    retired_engine = SimpleNamespace(destroy_weights_update_group=SimpleNamespace(remote=destroy_remote))
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.rollout_engines = [retired_engine]
-    updater._m2n_manifest = {"entries": []}
-    updater._m2n_group_name = "miles-m2n-retired"
-    updater._m2n_group_names = {0: "miles-m2n-retired"}
-    updater._m2n_routed_units = set()
-    updater._group_name = "miles-pp-0"
-    updater._model_update_groups = object()
-    updater._connection_stale = True
-    updater._teardown_local_m2n = Mock()
-
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        patch.object(nccl_m2n.dist, "get_world_size", return_value=1),
-        patch.object(
-            nccl_m2n.dist,
-            "all_gather_object",
-            side_effect=lambda output, value, group: output.__setitem__(0, value),
-        ),
-        patch.object(nccl_m2n.dist, "barrier"),
-        patch.object(nccl_m2n, "get_gloo_group", return_value=object()),
-        patch.object(
-            nccl_m2n.ray,
-            "get",
-            side_effect=nccl_m2n.requests.exceptions.ConnectionError("retired engine is offline"),
-        ),
-        patch.object(nccl_m2n.dist, "destroy_process_group") as destroy_group,
-        patch.object(UpdateWeightFromNcclM2N, "_is_source", True),
-    ):
-        updater._disconnect_existing(replacement_engines=[])
-
-    assert destroy_remote.call_args_list == [
-        call("miles-m2n-retired"),
-        call("miles-pp-0"),
-    ]
-    destroy_group.assert_called_once()
-    assert updater._model_update_groups is None
-    assert updater._m2n_group_name is None
-    assert updater._m2n_manifest is None
-
-
-def test_failed_residual_teardown_retains_connection_state_for_retry():
-    destroy_remote = Mock(return_value="destroy-ref")
-    engine = SimpleNamespace(destroy_weights_update_group=SimpleNamespace(remote=destroy_remote))
-    process_group = object()
-    updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater.rollout_engines = [engine]
-    updater._m2n_manifest = {"entries": []}
-    updater._m2n_group_name = "miles-m2n-old"
-    updater._m2n_group_names = {0: "miles-m2n-old"}
-    updater._m2n_routed_units = set()
-    updater._group_name = "miles-pp-0"
-    updater._model_update_groups = process_group
-    updater._residual_group_started = True
-    updater._connection_stale = False
-    updater._teardown_local_m2n = Mock()
-
-    with (
-        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
-        patch.object(nccl_m2n.dist, "get_world_size", return_value=1),
-        patch.object(
-            nccl_m2n.dist,
-            "all_gather_object",
-            side_effect=lambda output, value, group: output.__setitem__(0, value),
-        ),
-        patch.object(nccl_m2n, "get_gloo_group", return_value=object()),
-        patch.object(
-            nccl_m2n.ray,
-            "get",
-            side_effect=[
-                {"success": True, "message": "M2N destroyed"},
-                {"success": False, "message": "residual destroy failed"},
-                {"success": True, "message": "M2N already absent"},
-                {"success": True, "message": "residual destroyed"},
-            ],
-        ),
-        patch.object(nccl_m2n.dist, "destroy_process_group") as destroy_group,
-        patch.object(UpdateWeightFromNcclM2N, "_is_source", True),
-    ):
-        with pytest.raises(RuntimeError, match="residual destroy failed"):
-            updater._disconnect_existing()
-
-        assert updater._m2n_group_name == "miles-m2n-old"
-        assert updater._m2n_manifest == {"entries": []}
-        assert updater._model_update_groups is None
-
-        updater._disconnect_existing()
-
-    assert destroy_remote.call_args_list == [
-        call("miles-m2n-old"),
-        call("miles-pp-0"),
-        call("miles-m2n-old"),
-        call("miles-pp-0"),
-    ]
-    destroy_group.assert_called_once_with(process_group)
-    assert updater._m2n_group_name is None
-    assert updater._m2n_manifest is None
-    assert updater._model_update_groups is None

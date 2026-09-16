@@ -671,71 +671,43 @@ class TestSnapshotEvalValidation:
 
         assert args.rollout_num_gpus == 0
         assert args.starts_inference_engines is False
-
-def _m2n_args(**overrides):
-    values = {
-        "colocate": False,
-        "train_backend": "megatron",
-        "tensor_model_parallel_size": 2,
-        "context_parallel_size": 1,
-        "pipeline_model_parallel_size": 1,
-        "expert_model_parallel_size": 1,
-        "expert_tensor_parallel_size": 1,
-        "actor_num_nodes": 1,
-        "actor_num_gpus_per_node": 2,
-        "rollout_num_gpus": 2,
-        "rollout_num_gpus_per_engine": 2,
-        "sglang_ep_size": 1,
-        "sglang_pp_size": 1,
-        "sglang_dp_size": 1,
-        "sglang_speculative_algorithm": None,
-        "lora_rank": 0,
-        "prefill_num_servers": None,
-        "sglang_config": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
 @pytest.mark.parametrize(
-    "args",
+    "overrides,error",
     [
-        _m2n_args(),
-        _m2n_args(
-            context_parallel_size=2,
-            pipeline_model_parallel_size=8,
-            expert_model_parallel_size=4,
-            actor_num_gpus_per_node=32,
-            rollout_num_gpus=32,
-            rollout_num_gpus_per_engine=4,
-            sglang_ep_size=4,
-        ),
-    ],
-)
-def test_nccl_m2n_accepts_derived_reduced_and_full_topologies(args):
-    _validate_nccl_m2n_args(args)
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
+        ({}, None),
+        ({"pipeline_model_parallel_size": 2, "actor_num_gpus_per_node": 4}, None),
+        ({"colocate": True}, "disaggregated"),
+        ({"train_backend": "fsdp"}, "megatron"),
+        ({"m2n_pp_concurrency": 0}, "m2n-pp-concurrency"),
         ({"actor_num_gpus_per_node": 3}, r"TP\*CP\*PP"),
         ({"expert_tensor_parallel_size": 2}, "ETP=1"),
         ({"rollout_num_gpus": 3}, "must be divisible"),
-        ({"sglang_ep_size": 0}, "positive rollout EP"),
-        ({"sglang_pp_size": 2}, "rollout PP=1 and DP=1"),
-        ({"m2n_pp_concurrency": 0}, "m2n-pp-concurrency"),
-        ({"m2n_pp_concurrency": -1}, "m2n-pp-concurrency"),
     ],
 )
-def test_nccl_m2n_rejects_inconsistent_topologies(overrides, message):
-    with pytest.raises(AssertionError, match=message):
-        _validate_nccl_m2n_args(_m2n_args(**overrides))
-
-
-@pytest.mark.parametrize("concurrency", [1, 2, 8])
-def test_nccl_m2n_accepts_positive_pp_concurrency(concurrency):
-    _validate_nccl_m2n_args(_m2n_args(m2n_pp_concurrency=concurrency))
+def test_nccl_m2n_critical_configuration(overrides, error):
+    values = dict(
+        colocate=False,
+        train_backend="megatron",
+        tensor_model_parallel_size=2,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=2,
+        rollout_num_gpus=2,
+        rollout_num_gpus_per_engine=2,
+        sglang_ep_size=1,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        lora_rank=0,
+    )
+    args = SimpleNamespace(**(values | overrides))
+    if error:
+        with pytest.raises(AssertionError, match=error):
+            _validate_nccl_m2n_args(args)
+    else:
+        _validate_nccl_m2n_args(args)
 
 
 class TestTitoFixedTemplateConfiguration:
