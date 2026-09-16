@@ -14,9 +14,8 @@ from miles.utils.arguments import (
     _resolve_ft_components,
     _resolve_mini_ft_controller_enable,
     _resolve_rollout_functions,
-    _validate_rematerialize_param_from_master_weight,
-
     _validate_nccl_m2n_args,
+    _validate_rematerialize_param_from_master_weight,
     get_miles_extra_args_provider,
     miles_validate_args,
     resolve_rollout_function_paths,
@@ -671,6 +670,8 @@ class TestSnapshotEvalValidation:
 
         assert args.rollout_num_gpus == 0
         assert args.starts_inference_engines is False
+
+
 @pytest.mark.parametrize(
     "overrides,error",
     [
