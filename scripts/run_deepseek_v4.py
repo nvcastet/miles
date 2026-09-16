@@ -667,9 +667,9 @@ def _train(args: ScriptArgs):
         "--train-memory-margin-bytes 3221225472 "
         "--sglang-mem-fraction-static 0.7 "
         "--accumulate-allreduce-grads-in-fp32 "
-        # GB300 host RAM is smaller than the engine weight mirror plus the trainer
-        # backup, so overlap the handoff on the GPU instead.
-        f"{'--colocate-memory-peak-device gpu ' if args.hardware == 'GB300' else ''}"
+        # For colocated GB300 runs, overlap the offload handoff on the GPU to
+        # avoid holding the engine weight mirror and trainer backup in host RAM.
+        f"{'--colocate-memory-peak-device gpu ' if args.hardware == 'GB300' and args.colocate else ''}"
         f"--dsv4-impl {args.dsv4_impl} "
         f"{f'--dsa-kernel-backend {args.dsa_kernel_backend} ' if args.dsa_kernel_backend else ''}"
         "--model-name deepseekv4 "  # for mbridge load
