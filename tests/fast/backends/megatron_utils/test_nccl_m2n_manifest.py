@@ -193,7 +193,7 @@ def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused():
     )
     stream = Mock()
     with (
-        patch.object(nccl_m2n, "_nccl_rl", return_value=m2n),
+        patch.object(nccl_m2n, "_nccl_m2n", return_value=m2n),
         patch.object(
             nccl_m2n,
             "_quantize_canonical_block_fp8",
@@ -312,7 +312,7 @@ def test_sender_orders_dense_expert_source_handoffs_inside_one_pp_group():
     events = []
     m2n.reshard.side_effect = lambda *args, **kwargs: events.append(kwargs["src_mesh"])
     with (
-        patch.object(nccl_m2n, "_nccl_rl", return_value=m2n),
+        patch.object(nccl_m2n, "_nccl_m2n", return_value=m2n),
         patch.object(nccl_m2n.torch.cuda, "current_stream"),
         patch.object(nccl_m2n.dist, "barrier", side_effect=lambda group: events.append("handoff")) as barrier,
     ):
