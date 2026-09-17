@@ -24,10 +24,13 @@ is unchanged.
 export MEGATRON_PATH=/root/Megatron-LM
 export HF_CHECKPOINT=/root/models/Qwen3-0.6B
 export TRAIN_CHECKPOINT=/root/models/Qwen3-0.6B_torch_dist
+export DATA_DIR=/root/datasets
 export PYTHONPATH="$PWD:$MEGATRON_PATH${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 hf download Qwen/Qwen3-0.6B --local-dir "$HF_CHECKPOINT"
+hf download --repo-type dataset zhuzilin/dapo-math-17k \
+  --local-dir "$DATA_DIR/dapo-math-17k"
 MODEL_ARGS_TEXT="$(python3 miles/utils/external_utils/model_args_utils.py qwen3-0.6B)"
 read -r -a MODEL_ARGS <<< "$MODEL_ARGS_TEXT"
 torchrun --standalone --nproc-per-node 2 tools/convert_hf_to_torch_dist.py \
@@ -35,8 +38,9 @@ torchrun --standalone --nproc-per-node 2 tools/convert_hf_to_torch_dist.py \
   --save "$TRAIN_CHECKPOINT" --pipeline-model-parallel-size 2
 ```
 
-Skip download/conversion if both checkpoints already exist. Use a fresh output
-directory for conversion. Do not run conversion alongside training on these GPUs.
+Skip checkpoint download/conversion or dataset download when the corresponding
+files already exist. Use a fresh output directory for conversion. Do not run
+conversion alongside training on these GPUs.
 
 ## Run
 
@@ -48,15 +52,18 @@ ray start --head --num-gpus 4 --disable-usage-stats --dashboard-host 127.0.0.1
 bash examples/nccl_m2n/run-qwen3-0.6b.sh
 ```
 
-It uses eight bundled math prompts, checks initial weights against the HF-loaded
+It uses `zhuzilin/dapo-math-17k`, checks initial weights against the HF-loaded
 rollout model (`--check-weight-update-equal`), and performs two rollout/train/refit
 iterations. Check for successful equality checks, both PP groups transferring,
 and `train/train_rollout_logprob_abs_diff` staying near the broadcast baseline;
 the weight check alone cannot detect stale CUDA-graph pointers on later refits.
 
-Set `M2N_PP_CONCURRENCY=1` for stage-ordered refits (default: 2). Set `PROMPT_DATA`
-to another JSONL with `prompt` and `label` fields, or `RAY_DASHBOARD_ADDRESS` to
-another dashboard endpoint. Extra training arguments are appended last, e.g.:
+Set `M2N_PP_CONCURRENCY=1` for stage-ordered refits (default: 2). `DATA_DIR`
+defaults to `/root/datasets`; the launcher reads
+`$DATA_DIR/dapo-math-17k/dapo-math-17k.jsonl`. Set `PROMPT_DATA` to override that
+path with another JSONL containing `prompt` and `label` fields, or
+`RAY_DASHBOARD_ADDRESS` to another dashboard endpoint. Extra training arguments
+are appended last, e.g.:
 
 ```bash
 M2N_PP_CONCURRENCY=1 bash examples/nccl_m2n/run-qwen3-0.6b.sh
