@@ -27,7 +27,6 @@ from miles.backends.training_utils.weight_update.protocols.broadcast import (
     update_weights_from_distributed,
 )
 from miles.backends.training_utils.weight_update.protocols.nccl_m2n_manifest import (
-    _FP8_BLOCK_SIZE,
     _build_manifest,
     _dtype_from_name,
     _fp8_manifest_quantization,
@@ -40,7 +39,6 @@ from miles.backends.training_utils.weight_update.protocols.nccl_m2n_manifest imp
 from miles.backends.training_utils.weight_update.utils import get_data_replica_rank_and_size
 from miles.utils import async_utils
 from miles.utils.distributed_utils import get_gloo_group, init_process_group
-from miles.utils.fp8_kernel import blockwise_cast_to_fp8_triton
 
 logger = logging.getLogger(__name__)
 
@@ -83,28 +81,21 @@ def _is_unreachable_engine_error(error: Exception) -> bool:
     return isinstance(error, httpx.TransportError)
 
 
-def _quantize_canonical_block_fp8(
-    weight: torch.Tensor,
-    *,
-    scale_format: str = "canonical",
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_block_fp8_ue8m0(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if weight.dtype != torch.bfloat16 or weight.dim() != 3:
         raise ValueError(
             "NCCL M2N FP8 expert sources must be 3-D BF16 tensors, "
             f"got shape={tuple(weight.shape)} dtype={weight.dtype}"
         )
+    if per_block_cast_to_fp8 is None:
+        raise RuntimeError("NCCL M2N UE8M0 transfers require the trainer's power-of-two FP8 quantizer")
     scale_shape = _fp8_scale_shape(weight.shape, "FP8 expert source")
     flat = weight.contiguous().view(-1, weight.shape[-1])
-    if scale_format == "ue8m0_unpacked" and per_block_cast_to_fp8 is None:
-        raise RuntimeError("NCCL M2N UE8M0 transfers require the trainer's power-of-two FP8 quantizer")
-    if per_block_cast_to_fp8 is not None:
-        qweight, scale = per_block_cast_to_fp8(flat)
-    else:
-        qweight, scale = blockwise_cast_to_fp8_triton(flat, list(_FP8_BLOCK_SIZE))
+    qweight, scale = per_block_cast_to_fp8(flat)
     qweight = qweight.view_as(weight).contiguous()
     scale = scale.view(scale_shape).to(torch.float32).contiguous()
     if qweight.dtype != torch.float8_e4m3fn:
-        raise RuntimeError(f"Canonical FP8 quantizer returned unexpected dtype {qweight.dtype}")
+        raise RuntimeError(f"UE8M0 FP8 quantizer returned unexpected dtype {qweight.dtype}")
     return qweight, scale
 
 
@@ -263,11 +254,9 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
 
     def _negotiate_manifest(self, engine_gpu_counts: Sequence[int]) -> dict[str, Any]:
         try:
-            record = {
-                "payload": self._trainer_payload(),
-                "error": None,
-                "supports_ue8m0": per_block_cast_to_fp8 is not None,
-            }
+            if self._m2n_quantization is not None and per_block_cast_to_fp8 is None:
+                raise RuntimeError("NCCL M2N FP8 requires the UE8M0 quantizer on every trainer rank")
+            record = {"payload": self._trainer_payload(), "error": None}
         except Exception as exc:
             record = {
                 "payload": None,
@@ -286,19 +275,10 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             else:
                 payloads = [item["payload"] for item in gathered if item is not None and item["payload"] is not None]
                 try:
-                    quantization = self._m2n_quantization
-                    if quantization is not None:
-                        supports_ue8m0 = all(
-                            item is not None and item.get("supports_ue8m0", False) for item in gathered
-                        )
-                        quantization = {
-                            **quantization,
-                            "scale_format": "ue8m0_unpacked" if supports_ue8m0 else "canonical",
-                        }
                     manifest = _build_manifest(
                         payloads,
                         engine_gpu_counts,
-                        quantization_config=quantization,
+                        quantization_config=self._m2n_quantization,
                         destination_ep_size=self.args.sglang_ep_size,
                     )
                     objects[0] = {
@@ -647,7 +627,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         if failures:
             raise RuntimeError("NCCL M2N residual update failed: " + " | ".join(failures))
 
-    def _source_tensor(self, entry: Mapping[str, Any], *, scale_format: str = "canonical") -> torch.Tensor:
+    def _source_tensor(self, entry: Mapping[str, Any]) -> torch.Tensor:
         if self._m2n_comm_rank is None:
             raise RuntimeError("Current trainer rank is not in the NCCL M2N communicator")
         source = entry["source"]
@@ -673,7 +653,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
                     self._m2n_local_tensors[name].data.to(self._source_device, non_blocking=True) for name in names
                 ]
                 logical = self._logical_source_tensor(tensors, base_recipe)
-                qweight, scale = _quantize_canonical_block_fp8(logical, scale_format=scale_format)
+                qweight, scale = _quantize_block_fp8_ue8m0(logical)
                 cache[pair_id] = {"weight": qweight, "scale": scale}
             result = cache[pair_id][tensor_role]
             expected_shape = tuple(source["local_shape"])
@@ -741,9 +721,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
                 previous_source_mesh = source_descriptor["mesh"]
                 source = None
                 if any(self._m2n_comm_rank in row for row in source_descriptor["mesh"]):
-                    source = self._source_tensor(
-                        entry, scale_format=manifest.get("quantization", {}).get("scale_format", "canonical")
-                    )
+                    source = self._source_tensor(entry)
                 dtype = _dtype_from_name(entry["dtype"])
                 m2n.reshard(
                     source,
