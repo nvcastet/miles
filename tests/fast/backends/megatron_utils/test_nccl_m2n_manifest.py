@@ -77,9 +77,11 @@ def _payloads():
 
 
 @pytest.mark.parametrize("fp8,ep", [(False, 2), (False, 1), (True, 2), (True, 1)])
-def test_manifest_ownership_shards_replicas_and_fp8_pairs(fp8, ep):
+@pytest.mark.parametrize("scale_format", ["canonical", "ue8m0_unpacked"])
+def test_manifest_ownership_shards_replicas_and_fp8_pairs(fp8, ep, scale_format):
     payloads = _payloads()
-    kwargs = dict(destination_ep_size=ep, quantization_config=_FP8_CONFIG if fp8 else None)
+    config = {**_FP8_CONFIG, "scale_format": scale_format} if fp8 else None
+    kwargs = dict(destination_ep_size=ep, quantization_config=config)
     manifest = _build_manifest(payloads, [2, 2], **kwargs)
     assert manifest == _build_manifest(list(reversed(payloads)), [2, 2], **kwargs)
     original = deepcopy(manifest)
@@ -109,7 +111,7 @@ def test_manifest_ownership_shards_replicas_and_fp8_pairs(fp8, ep):
             assert entry["destination"]["local_shape"] == shape
         if fp8:
             manifest_utils._validate_fp8_pairs(stage["entries"])
-            assert stage["quantization"]["scale_format"] == "canonical"
+            assert stage["quantization"]["scale_format"] == scale_format
             pairs = {}
             for entry in stage["entries"]:
                 pairs.setdefault(entry["pair_id"], {})[entry["tensor_role"]] = entry
@@ -145,11 +147,12 @@ def test_atomic_fallback_does_not_drop_peer_weights(fp8, family):
     assert any(name.startswith("model.layers.1.") for name in names)
 
 
-def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused():
+@pytest.mark.parametrize("scale_format", ["canonical", "ue8m0_unpacked"])
+def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused(scale_format):
     manifest = _build_manifest(
         _payloads(),
         [2],
-        quantization_config=_FP8_CONFIG,
+        quantization_config={**_FP8_CONFIG, "scale_format": scale_format},
     )
     pair_id = "model.layers.0.mlp.experts.gate_proj.weight"
     pair_entries = [entry for entry in manifest["entries"] if entry["pair_id"] == pair_id]
@@ -164,7 +167,7 @@ def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused():
     fused_fc1[256:].fill_(9)
 
     updater = object.__new__(UpdateWeightFromNcclM2N)
-    updater._m2n_manifest = {"entries": pair_entries}
+    updater._m2n_manifest = {"entries": pair_entries, "quantization": manifest["quantization"]}
     updater._m2n_pg = object()
     updater._m2n_comm_ptr = 123
     updater._m2n_comm_rank = 0
@@ -174,7 +177,8 @@ def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused():
 
     quantized_inputs = []
 
-    def quantize(logical):
+    def quantize(logical, **kwargs):
+        assert kwargs == {"scale_format": scale_format}
         quantized_inputs.append(logical.clone())
         marker = float(logical[0, 0, 0])
         return (
@@ -233,6 +237,59 @@ def test_fp8_source_pair_is_quantized_once_per_batch_and_never_reused():
     assert torch.all(second_weight == 2)
     assert torch.all(second_scale == 2)
     assert stream.synchronize.call_count == 4
+
+
+def test_ue8m0_wire_format_never_silently_uses_the_fallback_quantizer():
+    weight = torch.ones((2, 128, 256), dtype=torch.bfloat16)
+    quantized = torch.ones((256, 256), dtype=torch.float8_e4m3fn)
+    scales = torch.full((2, 2), 0.5)
+    with (
+        patch.object(nccl_m2n, "per_block_cast_to_fp8", return_value=(quantized, scales)) as quantize,
+        patch.object(nccl_m2n, "blockwise_cast_to_fp8_triton") as fallback,
+    ):
+        actual_weight, actual_scale = nccl_m2n._quantize_canonical_block_fp8(weight, scale_format="ue8m0_unpacked")
+        assert actual_weight.shape == weight.shape
+        assert actual_scale.shape == (2, 1, 2)
+        assert actual_scale.dtype == torch.float32 and actual_scale.is_contiguous()
+        assert torch.all(actual_scale == 0.5)
+        quantize.assert_called_once()
+        fallback.assert_not_called()
+    with (
+        patch.object(nccl_m2n, "per_block_cast_to_fp8", None),
+        patch.object(nccl_m2n, "blockwise_cast_to_fp8_triton", return_value=(quantized, scales)) as fallback,
+    ):
+        with pytest.raises(RuntimeError, match="power-of-two"):
+            nccl_m2n._quantize_canonical_block_fp8(weight, scale_format="ue8m0_unpacked")
+        fallback.assert_not_called()
+        nccl_m2n._quantize_canonical_block_fp8(weight)
+        fallback.assert_called_once()
+
+
+@pytest.mark.parametrize("peer_supports_ue8m0", [False, True])
+def test_ue8m0_wire_format_requires_all_trainers_to_support_it(peer_supports_ue8m0):
+    payloads = _payloads()
+    updater = object.__new__(UpdateWeightFromNcclM2N)
+    updater.args = SimpleNamespace(sglang_ep_size=2)
+    updater._m2n_quantization = manifest_utils._fp8_manifest_quantization(_FP8_CONFIG)
+    updater._trainer_payload = Mock(return_value=payloads[0])
+
+    def gather(records, local, **kwargs):
+        assert local["supports_ue8m0"]
+        records[:] = [
+            {**local, "payload": payload, "supports_ue8m0": rank != 1 or peer_supports_ue8m0}
+            for rank, payload in enumerate(payloads)
+        ]
+
+    with (
+        patch.object(nccl_m2n, "per_block_cast_to_fp8", Mock()),
+        patch.object(nccl_m2n, "get_gloo_group"),
+        patch.object(nccl_m2n.dist, "get_world_size", return_value=8),
+        patch.object(nccl_m2n.dist, "get_rank", return_value=0),
+        patch.object(nccl_m2n.dist, "all_gather_object", side_effect=gather),
+        patch.object(nccl_m2n.dist, "broadcast_object_list"),
+    ):
+        manifest = updater._negotiate_manifest([2, 2])
+    assert manifest["quantization"]["scale_format"] == ("ue8m0_unpacked" if peer_supports_ue8m0 else "canonical")
 
 
 @pytest.mark.parametrize("local_pp", [0, 1, 2])
