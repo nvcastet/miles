@@ -85,6 +85,8 @@ def _is_unreachable_engine_error(error: Exception) -> bool:
 
 def _quantize_canonical_block_fp8(
     weight: torch.Tensor,
+    *,
+    scale_format: str = "canonical",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if weight.dtype != torch.bfloat16 or weight.dim() != 3:
         raise ValueError(
@@ -93,6 +95,8 @@ def _quantize_canonical_block_fp8(
         )
     scale_shape = _fp8_scale_shape(weight.shape, "FP8 expert source")
     flat = weight.contiguous().view(-1, weight.shape[-1])
+    if scale_format == "ue8m0_unpacked" and per_block_cast_to_fp8 is None:
+        raise RuntimeError("NCCL M2N UE8M0 transfers require the trainer's power-of-two FP8 quantizer")
     if per_block_cast_to_fp8 is not None:
         qweight, scale = per_block_cast_to_fp8(flat)
     else:
@@ -259,7 +263,11 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
 
     def _negotiate_manifest(self, engine_gpu_counts: Sequence[int]) -> dict[str, Any]:
         try:
-            record = {"payload": self._trainer_payload(), "error": None}
+            record = {
+                "payload": self._trainer_payload(),
+                "error": None,
+                "supports_ue8m0": per_block_cast_to_fp8 is not None,
+            }
         except Exception as exc:
             record = {
                 "payload": None,
@@ -278,10 +286,19 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             else:
                 payloads = [item["payload"] for item in gathered if item is not None and item["payload"] is not None]
                 try:
+                    quantization = self._m2n_quantization
+                    if quantization is not None:
+                        supports_ue8m0 = all(
+                            item is not None and item.get("supports_ue8m0", False) for item in gathered
+                        )
+                        quantization = {
+                            **quantization,
+                            "scale_format": "ue8m0_unpacked" if supports_ue8m0 else "canonical",
+                        }
                     manifest = _build_manifest(
                         payloads,
                         engine_gpu_counts,
-                        quantization_config=self._m2n_quantization,
+                        quantization_config=quantization,
                         destination_ep_size=self.args.sglang_ep_size,
                     )
                     objects[0] = {
@@ -630,7 +647,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         if failures:
             raise RuntimeError("NCCL M2N residual update failed: " + " | ".join(failures))
 
-    def _source_tensor(self, entry: Mapping[str, Any]) -> torch.Tensor:
+    def _source_tensor(self, entry: Mapping[str, Any], *, scale_format: str = "canonical") -> torch.Tensor:
         if self._m2n_comm_rank is None:
             raise RuntimeError("Current trainer rank is not in the NCCL M2N communicator")
         source = entry["source"]
@@ -656,7 +673,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
                     self._m2n_local_tensors[name].data.to(self._source_device, non_blocking=True) for name in names
                 ]
                 logical = self._logical_source_tensor(tensors, base_recipe)
-                qweight, scale = _quantize_canonical_block_fp8(logical)
+                qweight, scale = _quantize_canonical_block_fp8(logical, scale_format=scale_format)
                 cache[pair_id] = {"weight": qweight, "scale": scale}
             result = cache[pair_id][tensor_role]
             expected_shape = tuple(source["local_shape"])
@@ -724,7 +741,9 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
                 previous_source_mesh = source_descriptor["mesh"]
                 source = None
                 if any(self._m2n_comm_rank in row for row in source_descriptor["mesh"]):
-                    source = self._source_tensor(entry)
+                    source = self._source_tensor(
+                        entry, scale_format=manifest.get("quantization", {}).get("scale_format", "canonical")
+                    )
                 dtype = _dtype_from_name(entry["dtype"])
                 m2n.reshard(
                     source,

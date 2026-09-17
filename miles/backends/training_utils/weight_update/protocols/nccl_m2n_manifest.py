@@ -68,9 +68,12 @@ def _fp8_manifest_quantization(
             "quant_method='fp8', fmt='e4m3', activation_scheme='dynamic', "
             "weight_block_size=[128, 128]"
         )
-    # Checkpoint scale_fmt does not determine the M2N wire format: source
-    # weights are requantized and scales are transferred as canonical FP32.
-    return dict(_FP8_MANIFEST_QUANTIZATION)
+    # Checkpoint scale_fmt does not determine the wire format. Negotiation can
+    # additionally promise power-of-two scales, still stored as unpacked FP32.
+    scale_format = quantization_config.get("scale_format", "canonical")
+    if scale_format not in ("canonical", "ue8m0_unpacked"):
+        raise ValueError(f"Unsupported NCCL M2N scale format {scale_format!r}")
+    return {**_FP8_MANIFEST_QUANTIZATION, "scale_format": scale_format}
 
 
 def _fp8_scale_shape(

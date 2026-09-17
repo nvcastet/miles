@@ -55,6 +55,15 @@ For Qwen3-0.6B, the M2N path carries dense MLP gate/up/down weights; attention,
 embeddings, output head, and normalization weights use broadcast. Supported FP8
 expert transfers additionally carry quantized weights and their scales.
 
+For DeepGEMM FP8 refits, trainers with the power-of-two quantizer advertise
+`ue8m0_unpacked` scales. The wire tensors remain FP8 weights and compact FP32
+block scales so M2N can reshard them before inference-layout packing. When
+rollout already has compatible packed DeepGEMM buffers, it only packs the scales:
+weights are not requantized, down-projection weights receive directly, and
+gate/up weights are copied into their fused slices. All inference buffer
+addresses and strides stay unchanged. Canonical transfers and other backend
+layouts retain the post-processing and storage-restoration fallback shown above.
+
 ## Prepare
 
 Use compatible Miles and SGLang versions with M2N support installed in the same
