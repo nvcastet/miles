@@ -52,15 +52,53 @@ For Qwen3-0.6B, the M2N path carries dense MLP gate/up/down weights; attention,
 embeddings, output head, and normalization weights use broadcast. Supported FP8
 expert transfers additionally carry quantized weights and their scales.
 
-FP8 M2N refits require the power-of-two quantizer on every trainer rank and
-compatible, already-packed DeepGEMM inference buffers on rollout. The only FP8
-wire format is `ue8m0_unpacked`: FP8 weights and compact FP32 power-of-two block
-scales, which M2N reshards before inference-layout packing. Rollout only packs
-the scales; weights are not requantized, down-projection weights receive
-directly, and gate/up weights are copied into their fused slices. All inference
-buffer addresses and strides stay unchanged, without storage snapshots or
-restoration. Unsupported FP8 formats/backends are rejected before transfer;
-there is no canonical FP8 fallback. BF16 transfers are unchanged.
+FP8 M2N refits select the scale format using the same rollout-backend policy as
+broadcast. Canonical block-FP8 destinations receive FP8 weights and FP32 block
+scales into their existing buffers. DeepGEMM UE8M0 destinations require the
+power-of-two quantizer on every trainer rank and already-packed inference
+buffers: rollout packs the incoming FP32 power-of-two scales, without
+requantizing weights. Down projections receive directly when contiguous;
+gate/up tensors are copied into their fused slices. All inference buffer
+addresses and strides stay unchanged, without storage snapshots or restoration.
+Mismatched, shuffled, or unsupported layouts are rejected before transfer;
+there is no storage-replacing conversion fallback. BF16 transfers are unchanged.
+
+### FP8 manifest formats
+
+The manifest's `quantization` block is explicit. Canonical block-FP8 uses:
+
+```json
+{
+  "quant_method": "fp8",
+  "activation_scheme": "dynamic",
+  "weight_block_size": [128, 128],
+  "weight_dtype": "float8_e4m3fn",
+  "scale_dtype": "float32",
+  "scale_format": "canonical"
+}
+```
+
+DeepGEMM UE8M0 uses the same fields except `scale_format`:
+
+```json
+{
+  "quant_method": "fp8",
+  "activation_scheme": "dynamic",
+  "weight_block_size": [128, 128],
+  "weight_dtype": "float8_e4m3fn",
+  "scale_dtype": "float32",
+  "scale_format": "ue8m0_unpacked"
+}
+```
+
+Both use paired `weight` / `scale` entries with the same meshes, placements,
+recipes, and wire shapes for a given topology. For example, a down-projection
+weight with destination `local_shape: [1, 256, 256]` has a scale entry with
+`dtype: "float32"` and destination `local_shape: [1, 2, 2]`. Canonical rollout
+storage keeps those FP32 scales as `[1, 2, 2]`; DeepGEMM packs them into its
+existing int32 `[1, 256, 1]` buffer. Packed inference shapes are **not** the M2N
+wire shapes. `ue8m0_unpacked` additionally guarantees power-of-two scale values.
+The manifest hash changes with the selected format.
 
 ## Prepare
 
