@@ -19,7 +19,7 @@ _FP8_MANIFEST_QUANTIZATION = {
     "weight_block_size": list(_FP8_BLOCK_SIZE),
     "weight_dtype": "float8_e4m3fn",
     "scale_dtype": "float32",
-    "scale_format": "canonical",
+    "scale_format": "ue8m0_unpacked",
 }
 _DENSE_RE = re.compile(r"module\.module\.decoder\.layers\.(\d+)\.mlp\.linear_fc([12])\.weight$")
 _EXPERT_RE = re.compile(r"module\.module\.decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc([12])\.weight(\d+)$")
@@ -68,12 +68,12 @@ def _fp8_manifest_quantization(
             "quant_method='fp8', fmt='e4m3', activation_scheme='dynamic', "
             "weight_block_size=[128, 128]"
         )
-    # Checkpoint scale_fmt does not determine the wire format. Negotiation can
-    # additionally promise power-of-two scales, still stored as unpacked FP32.
-    scale_format = quantization_config.get("scale_format", "canonical")
-    if scale_format not in ("canonical", "ue8m0_unpacked"):
+    # Checkpoint scale_fmt does not determine the wire format. The trainer
+    # always produces power-of-two scales, still stored as unpacked FP32.
+    scale_format = quantization_config.get("scale_format", "ue8m0_unpacked")
+    if scale_format != "ue8m0_unpacked":
         raise ValueError(f"Unsupported NCCL M2N scale format {scale_format!r}")
-    return {**_FP8_MANIFEST_QUANTIZATION, "scale_format": scale_format}
+    return dict(_FP8_MANIFEST_QUANTIZATION)
 
 
 def _fp8_scale_shape(

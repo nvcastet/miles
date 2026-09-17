@@ -47,7 +47,7 @@ flowchart TD
 
     M -->|No| N["Export remaining weights<br/>gather shards and convert to HF format<br/>exclude weights already routed through M2N"]
     N --> O["NCCL broadcast remaining weights<br/>SGLang loads them into the model"]
-    O --> P["end_weight_update<br/>run post-load and quantization processing<br/>restore original graph-visible FP8 buffers"]
+    O --> P["end_weight_update<br/>run post-load and quantization processing<br/>M2N FP8 buffers remain in place"]
     P --> Q["Publish weight version<br/>resume generation"]
 ```
 
@@ -55,14 +55,15 @@ For Qwen3-0.6B, the M2N path carries dense MLP gate/up/down weights; attention,
 embeddings, output head, and normalization weights use broadcast. Supported FP8
 expert transfers additionally carry quantized weights and their scales.
 
-For DeepGEMM FP8 refits, trainers with the power-of-two quantizer advertise
-`ue8m0_unpacked` scales. The wire tensors remain FP8 weights and compact FP32
-block scales so M2N can reshard them before inference-layout packing. When
-rollout already has compatible packed DeepGEMM buffers, it only packs the scales:
-weights are not requantized, down-projection weights receive directly, and
-gate/up weights are copied into their fused slices. All inference buffer
-addresses and strides stay unchanged. Canonical transfers and other backend
-layouts retain the post-processing and storage-restoration fallback shown above.
+FP8 M2N refits require the power-of-two quantizer on every trainer rank and
+compatible, already-packed DeepGEMM inference buffers on rollout. The only FP8
+wire format is `ue8m0_unpacked`: FP8 weights and compact FP32 power-of-two block
+scales, which M2N reshards before inference-layout packing. Rollout only packs
+the scales; weights are not requantized, down-projection weights receive
+directly, and gate/up weights are copied into their fused slices. All inference
+buffer addresses and strides stay unchanged, without storage snapshots or
+restoration. Unsupported FP8 formats/backends are rejected before transfer;
+there is no canonical FP8 fallback. BF16 transfers are unchanged.
 
 ## Prepare
 
