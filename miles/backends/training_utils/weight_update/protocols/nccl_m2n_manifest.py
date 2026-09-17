@@ -28,14 +28,14 @@ _EXPERT_RE = re.compile(r"module\.module\.decoder\.layers\.(\d+)\.mlp\.experts\.
 def _dtype_name(dtype: torch.dtype) -> str:
     name = str(dtype).removeprefix("torch.")
     if getattr(torch, name, None) is not dtype:
-        raise ValueError(f"Unsupported nccl-rl dtype {dtype}")
+        raise ValueError(f"Unsupported NCCL M2N dtype {dtype}")
     return name
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
     dtype = getattr(torch, name, None)
     if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"Unsupported nccl-rl dtype {name!r}")
+        raise ValueError(f"Unsupported NCCL M2N dtype {name!r}")
     return dtype
 
 
@@ -505,9 +505,9 @@ def _build_manifest(
 ) -> dict[str, Any]:
     quantization = _fp8_manifest_quantization(quantization_config)
     if not engine_gpu_counts or any(count <= 0 for count in engine_gpu_counts):
-        raise ValueError(f"nccl-rl requires positive rollout engine GPU counts, got {engine_gpu_counts}")
+        raise ValueError(f"NCCL M2N requires positive rollout engine GPU counts, got {engine_gpu_counts}")
     if len(set(engine_gpu_counts)) != 1:
-        raise ValueError("nccl-rl requires homogeneous rollout engine parallelism, " f"got {list(engine_gpu_counts)}")
+        raise ValueError("NCCL M2N requires homogeneous rollout engine parallelism, " f"got {list(engine_gpu_counts)}")
     destination_count = sum(engine_gpu_counts)
 
     all_specs = [spec for payload in trainer_payloads for spec in payload["specs"]]

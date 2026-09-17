@@ -1,4 +1,4 @@
-"""Hybrid nccl-rl reshard plus broadcast weight updates."""
+"""Hybrid NCCL M2N reshard plus broadcast weight updates."""
 
 from __future__ import annotations
 
@@ -110,19 +110,19 @@ def _process_group_options() -> Any:
     return options
 
 
-def _nccl_rl() -> Any:
+def _nccl_m2n() -> Any:
     try:
         from nccl import m2n
     except Exception as exc:
         raise RuntimeError(
-            "nccl-rl was selected, but its nccl.m2n package or native library " "is unavailable"
+            "NCCL M2N was selected, but its nccl.m2n package or native library " "is unavailable"
         ) from exc
     return m2n
 
 
 def _warm_and_borrow_nccl_comm(pg: dist.ProcessGroup, device: torch.device) -> int:
     if device.type != "cuda":
-        raise RuntimeError(f"nccl-rl requires CUDA, got {device}")
+        raise RuntimeError(f"NCCL M2N requires CUDA, got {device}")
     torch.cuda.set_device(device)
     dist.all_reduce(torch.zeros(1, device=device), group=pg)
     torch.cuda.synchronize(device)
@@ -161,8 +161,8 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
 
     def __init__(self, args: Namespace) -> None:
         if not torch.cuda.is_available():
-            raise RuntimeError("nccl-rl requires CUDA in the trainer process")
-        _nccl_rl()
+            raise RuntimeError("NCCL M2N requires CUDA in the trainer process")
+        _nccl_m2n()
         super().__init__(args)
         self._source_device = torch.device("cuda", torch.cuda.current_device())
         self._m2n_group_name: str | None = None
@@ -310,7 +310,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
     def _teardown_local_m2n(self) -> None:
         if getattr(self, "_m2n_comm_ptr", None) is not None:
             torch.cuda.synchronize()
-            _nccl_rl().finalize()
+            _nccl_m2n().finalize()
             self._m2n_comm_ptr = None
         if getattr(self, "_m2n_pg", None) is not None:
             dist.destroy_process_group(self._m2n_pg)
@@ -395,7 +395,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             m2n_error = local_m2n_error if m2n_error is None else f"{local_m2n_error} | {m2n_error}"
         raise_collective(
             m2n_error,
-            "Failed to destroy nccl-rl PP connections",
+            "Failed to destroy NCCL M2N PP connections",
         )
 
         pp_size = getattr(
@@ -697,7 +697,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             or self._m2n_comm_rank is None
         ):
             return
-        m2n = _nccl_rl()
+        m2n = _nccl_m2n()
         manifest = self._m2n_manifest if manifest is None else manifest
         stream = torch.cuda.current_stream()
 
