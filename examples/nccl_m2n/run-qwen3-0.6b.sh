@@ -12,7 +12,8 @@ read -r -a MODEL_ARGS <<< "${MODEL_ARGS_TEXT}"
 : "${HF_CHECKPOINT:?Set HF_CHECKPOINT to the local Qwen3-0.6B directory}"
 : "${TRAIN_CHECKPOINT:?Set TRAIN_CHECKPOINT to its converted torch_dist checkpoint}"
 MEGATRON_PATH="${MEGATRON_PATH:-/root/Megatron-LM}"
-PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/prompts.jsonl}"
+DATA_DIR="${DATA_DIR:-/root/datasets}"
+PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl}"
 for input in "${HF_CHECKPOINT}/config.json" "${TRAIN_CHECKPOINT}/latest_checkpointed_iteration.txt" "${PROMPT_DATA}"; do
     if [[ ! -f "${input}" ]]; then
         echo "Missing input: ${input}" >&2
