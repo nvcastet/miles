@@ -477,6 +477,11 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
         placement: WeightUpdatePlacement,
         selector: str,
     ) -> None:
+        if self.args.sglang_speculative_algorithm and selector != "target":
+            raise ValueError(
+                "NCCL M2N supports speculation only with a frozen draft and target-only weight updates; "
+                "disable trainer MTP layers."
+            )
         del engine_gpu_offsets
         engine_gpu_counts = _validated_engine_gpu_counts(
             self.args,

@@ -2918,9 +2918,6 @@ def _validate_nccl_m2n_args(args):
         rollout_topology["PP"] == 1 and rollout_topology["DP"] == 1
     ), f"NCCL M2N requires rollout PP=1 and DP=1; got {rollout_topology}."
 
-    assert not getattr(
-        args, "sglang_speculative_algorithm", None
-    ), "NCCL M2N does not support a speculative/draft rollout model."
     assert args.lora_rank <= 0, "LoRA weight sync is not supported by NCCL M2N."
     assert (
         getattr(args, "prefill_num_servers", None) is None
