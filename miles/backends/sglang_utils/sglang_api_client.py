@@ -342,7 +342,6 @@ class SGLangApiClient:
             if strict:
                 raise
             # catch the case there the engine is just created and does not have the group.
-            pass
 
     async def update_weights_from_distributed(
         self,
