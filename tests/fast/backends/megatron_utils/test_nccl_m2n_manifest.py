@@ -489,22 +489,14 @@ def test_nccl_m2n_async_api_payload_and_strict_teardown():
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_nccl_m2n_session_failure_is_collective_and_marks_connection_stale(rank):
-    from miles.backends.training_utils.conn_status import ConnStatusManager
-    from miles.backends.training_utils.weight_update import updater as updater_module
-
+def test_nccl_m2n_session_failure_is_collective(rank):
     protocol = object.__new__(UpdateWeightFromNcclM2N)
     operation = Mock(side_effect=RuntimeError("prepare failed"))
-    updater = object.__new__(updater_module.WeightUpdater)
-    updater.conn_status = ConnStatusManager()
-    updater.conn_status.mark_reconnected({})
-    updater._update_weights = lambda: protocol.run_engine_session(operation)
     with (
         patch.object(nccl_m2n.dist, "get_rank", return_value=rank),
         patch.object(nccl_m2n, "_collect_errors", return_value=["prepare failed"]) as collect,
     ):
         with pytest.raises(RuntimeError, match="prepare failed"):
-            updater.update_weights()
-    assert updater.conn_status.needs_reconnect({})
+            protocol.run_engine_session(operation)
     assert operation.call_count == int(rank == 0)
     assert (collect.call_args.args[0] is None) is (rank != 0)

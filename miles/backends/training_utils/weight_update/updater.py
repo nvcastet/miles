@@ -95,13 +95,6 @@ class WeightUpdater:
     @torch.no_grad()
     def update_weights(self) -> None:
         """Run one weight sync: session frame + base-bucket stream + adapter pushes for LoRA."""
-        try:
-            self._update_weights()
-        except Exception:
-            self.conn_status.mark_trainer_stale()
-            raise
-
-    def _update_weights(self) -> None:
         protocol = self.protocol
         if not protocol.begin_sync(self.weight_version + 1, self._iter_base_buckets):
             return
