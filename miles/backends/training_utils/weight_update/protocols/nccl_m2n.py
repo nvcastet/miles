@@ -35,6 +35,7 @@ from miles.backends.training_utils.weight_update.protocols.nccl_m2n_manifest imp
     _fp8_scale_shape,
     _local_source_spec,
     _manifest_digest,
+    _receiver_manifest,
     _split_manifest_by_pp,
     _tensor_bytes,
 )
@@ -540,6 +541,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
             local_error: str | None = None
             if dist.get_rank() == 0:
                 try:
+                    wire_manifest = _receiver_manifest(stage_manifest)
                     rank_cursor = len(stage_manifest["source_world_ranks"])
                     for engine, count in zip(rollout_engines, engine_gpu_counts, strict=True):
                         refs.append(
@@ -551,7 +553,7 @@ class UpdateWeightFromNcclM2N(UpdateWeightFromDistributed):
                                     stage_manifest["communicator_world_size"],
                                     group_name,
                                     backend="nccl",
-                                    m2n_manifest=stage_manifest,
+                                    m2n_manifest=wire_manifest,
                                 )
                             )
                         )

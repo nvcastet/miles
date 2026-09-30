@@ -93,6 +93,17 @@ def _manifest_digest(manifest: Mapping[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _receiver_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Serialize the transfer plan without trainer-local ownership and packing metadata."""
+    local_fields = {"source_world_ranks", "trainer_world_to_comm_rank", "routed_update_units", "manifest_hash"}
+    wire = deepcopy({key: value for key, value in manifest.items() if key not in local_fields})
+    for entry in wire["entries"]:
+        entry["source"].pop("names_by_rank", None)
+        entry["source"].pop("recipe", None)
+    wire["manifest_hash"] = _manifest_digest(wire)
+    return wire
+
+
 def _split_manifest_by_pp(manifest: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
     """Give each PP owner a communicator-local manifest and staging namespace."""
     source_world = manifest["source_world_ranks"]

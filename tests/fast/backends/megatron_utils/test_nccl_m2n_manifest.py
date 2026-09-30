@@ -95,6 +95,16 @@ def test_manifest_ownership_shards_replicas_and_fp8_pairs(fp8, ep, scale_format)
         assert stage["trainer_world_to_comm_rank"] == {str(4 * pp + rank): rank for rank in range(4)}
         assert stage["communicator_world_size"] == 8
         assert stage["manifest_hash"] == manifest_utils._manifest_digest(stage)
+        wire = manifest_utils._receiver_manifest(stage)
+        assert not {"source_world_ranks", "trainer_world_to_comm_rank", "routed_update_units"} & wire.keys()
+        assert wire["manifest_hash"] == manifest_utils._manifest_digest(wire)
+        assert wire["entries"] == [
+            {
+                **entry,
+                "source": {key: entry["source"][key] for key in ("mesh", "placements", "local_shape")},
+            }
+            for entry in stage["entries"]
+        ]
         for entry in stage["entries"]:
             assert entry["pp_rank"] == pp
             layer = int(entry["name"].split(".")[2])
